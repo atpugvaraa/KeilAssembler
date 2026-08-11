@@ -72,7 +72,7 @@ suite runs via `swift test` with no app target present.
 
 ## 7. Constraints
 
-- macOS 26.5+, Apple Silicon (arm64) only.
+- macOS 15+, Apple Silicon (arm64) only.
 - Swift 6.3, `swiftLanguageModes: [.v6]`, strict concurrency.
 - Swift Testing (`@Test` / `#expect`), not XCTest.
 - Toolchain dependency: `/usr/bin/clang` (Command Line Tools). No Homebrew packages, no

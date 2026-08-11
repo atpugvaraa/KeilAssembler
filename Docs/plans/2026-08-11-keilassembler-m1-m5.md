@@ -12,7 +12,7 @@
 
 Copied verbatim from `Docs/PRD.md` §7 and `Docs/Spec.md`. Every task inherits these.
 
-- macOS 26.5+, Apple Silicon (arm64) only.
+- macOS 15+, Apple Silicon (arm64) only.
 - Swift 6.3, `swiftLanguageModes: [.v6]`, strict concurrency.
 - Swift Testing (`@Test` / `#expect`), not XCTest.
 - Toolchain dependency: `/usr/bin/clang` (Command Line Tools). No Homebrew packages, no `arm-none-eabi-*`, no QEMU.
@@ -155,7 +155,7 @@ import PackageDescription
 
 let package = Package(
     name: "KeilAssembler",
-    platforms: [.macOS(.v26)],
+    platforms: [.macOS(.v15)],
     products: [
         .library(name: "KeilAssembler", targets: ["KeilAssembler"]),
     ],
