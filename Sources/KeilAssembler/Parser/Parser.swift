@@ -421,6 +421,20 @@ struct Parser {
             } while match(.comma)
         }
 
+        // The loop above only re-enters on a comma. If it stopped for any other reason while
+        // there is still more on the line, an operand was silently dropped (e.g. `MOV R1 R2`
+        // parses `R1`, sees `R2` isn't a comma, and would otherwise exit clean). Diagnose it
+        // and consume the rest of the line so the orphan isn't re-dispatched as a bogus
+        // top-level statement.
+        if peek() != .endOfLine, peek() != .endOfFile {
+            diagnostics.emit(Diagnostic(
+                severity: .error, code: "E040",
+                message: "expected ',' or end of line after operand",
+                range: current.range, note: nil
+            ))
+            skipToEndOfLine()
+        }
+
         return .instruction(Instruction(
             mnemonic: parts.mnemonic,
             condition: parts.condition,
@@ -504,8 +518,15 @@ struct Parser {
             return ShiftKind(text: word) != nil
         case .symbol(let word):
             return ShiftKind(text: word) != nil
-        default:
+        case .endOfLine, .endOfFile:
             return true
+        default:
+            // Some other token follows directly with no comma — e.g. `MOV R1 R2`. That is
+            // a missing-comma error, not a trailing operand; `parseInstruction`'s post-loop
+            // check (E040) is what actually diagnoses it. Returning false here just makes
+            // this register a plain one so the mis-following token is left for that check
+            // to see, rather than being silently absorbed as Operand2.
+            return false
         }
     }
 

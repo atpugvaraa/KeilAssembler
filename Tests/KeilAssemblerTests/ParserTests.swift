@@ -420,3 +420,27 @@ private func firstInstruction(_ source: String) -> Instruction? {
     #expect(bag.diagnostics.map(\.code) == ["E038"])
     #expect(program.lines.count == 1)
 }
+
+// MARK: - Review fix: a missing comma between operands must not silently truncate the list
+
+@Test func parserDiagnosesAMissingCommaBetweenOperands() {
+    // Without the fix, `registerIsTrailingOperand2`'s `default: return true` misclassifies R1
+    // as the trailing Operand2 (R2 is neither `.comma` nor `.symbol`), so R1 is consumed alone,
+    // the `while match(.comma)` loop exits normally (R2 isn't a comma either), and R2 is
+    // re-dispatched as a bogus second top-level statement — silently truncating the operand
+    // list with no diagnostic naming the actual problem.
+    let (program, bag) = parse("    MOV R1 R2\n")
+    #expect(bag.diagnostics.map(\.code) == ["E040"])
+    #expect(program.lines.count == 1)
+    #expect(firstInstruction("    MOV R1 R2\n")?.operands == [.register(1)])
+}
+
+@Test func parserDiagnosesAMissingCommaBeforeATrailingSymbol() {
+    // Same defect via a non-shift symbol operand: `registerIsTrailingOperand2`'s `.symbol`
+    // branch correctly returns false here (LABEL isn't a shift keyword), so R1 is a bare
+    // register — but nothing then checks that a comma (not LABEL) was supposed to follow.
+    let (program, bag) = parse("    MOV R1 LABEL\n")
+    #expect(bag.diagnostics.map(\.code) == ["E040"])
+    #expect(program.lines.count == 1)
+    #expect(firstInstruction("    MOV R1 LABEL\n")?.operands == [.register(1)])
+}
