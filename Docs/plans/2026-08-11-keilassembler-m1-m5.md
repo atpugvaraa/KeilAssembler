@@ -1718,6 +1718,19 @@ Expected: FAIL — the stub returns an instruction with `operands == []`.
             } while match(.comma)
         }
 
+        // The loop above ends whenever the next token is not a comma — which means
+        // "done" and "a required comma is missing" look identical to it. Without this
+        // check, `MOV R1 R2` yields a one-operand instruction with no diagnostic, and
+        // the orphaned R2 resurfaces as a phantom second statement (PRD S3).
+        if peek() != .endOfLine, peek() != .endOfFile {
+            diagnostics.emit(Diagnostic(
+                severity: .error, code: "E040",
+                message: "expected ',' or end of line after operand",
+                range: current.range, note: nil
+            ))
+            skipToEndOfLine()
+        }
+
         return .instruction(Instruction(
             mnemonic: parts.mnemonic,
             condition: parts.condition,
@@ -1750,10 +1763,11 @@ Expected: FAIL — the stub returns an instruction with `operands == []`.
         }
 
         // A bare register is either a destination/source register or the start of an
-        // Operand2 with a shift. `parseOperand2` decides.
+        // Operand2 with a shift. Note the shift clause is `Rm, LSL #2` — the comma sits
+        // between them — so looking at the token immediately after the register finds a
+        // comma, never the shift word. `registerIsTrailingOperand2` looks past it.
         if case .register(let number) = peek() {
-            let afterRegister = peek(1)
-            if case .symbol(let word) = afterRegister, ShiftKind(text: word) != nil {
+            if registerIsTrailingOperand2() {
                 guard let operand2 = parseOperand2(into: &diagnostics) else { return nil }
                 return .operand2(operand2)
             }
@@ -1785,6 +1799,25 @@ Expected: FAIL — the stub returns an instruction with `operands == []`.
             range: current.range, note: nil
         ))
         return nil
+    }
+
+    /// True when the register at the cursor begins a shifted Operand2 rather than
+    /// standing alone. Every unrecognised follower returns false: an unconditional
+    /// `default: true` would swallow `MOV R1 R2`'s first register into Operand2 and
+    /// silently drop the second.
+    private func registerIsTrailingOperand2() -> Bool {
+        switch peek(1) {
+        case .comma:
+            // `Rm, LSL #2` — the shift word sits one token past the comma.
+            if case .symbol(let word) = peek(2) { return ShiftKind(text: word) != nil }
+            return false
+        case .symbol(let word):
+            return ShiftKind(text: word) != nil
+        case .endOfLine, .endOfFile:
+            return true
+        default:
+            return false
+        }
     }
 
     /// Spec §6.2.
