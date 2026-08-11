@@ -387,10 +387,16 @@ struct Lexer {
             var result: [Token] = []
             for (lineIndex, characters) in lines.enumerated() {
                 scan(characters, line: lineIndex, into: &result, diagnostics: &bag)
-                result.append(Token(
-                    kind: .endOfLine,
-                    range: SourceRange(line: lineIndex, column: characters.count, length: 0)
-                ))
+                // Emit one `.endOfLine` per newline actually present in the source.
+                // Splitting with `omittingEmptySubsequences: false` yields a trailing
+                // empty element when the source ends in a newline; without this guard
+                // that element would contribute a spurious extra `.endOfLine`.
+                if lineIndex < lines.count - 1 {
+                    result.append(Token(
+                        kind: .endOfLine,
+                        range: SourceRange(line: lineIndex, column: characters.count, length: 0)
+                    ))
+                }
             }
             result.append(Token(
                 kind: .endOfFile,
