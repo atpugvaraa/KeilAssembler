@@ -76,3 +76,29 @@ private func lex(_ source: String) -> [Token.Kind] {
     #expect(tokens[6].kind == .register(2))
     #expect(tokens[6].range.line == 2)
 }
+
+@Test func lexerReadsEveryNumericLiteralForm() {
+    #expect(lex("&1F 0x1F 0X1F 31 2_00011111 8_37 16_1f") == [
+        .integer(0x1F), .integer(0x1F), .integer(0x1F),
+        .integer(31), .integer(0b0001_1111), .integer(0o37), .integer(0x1F),
+        .endOfFile,
+    ])
+}
+
+@Test func lexerReadsCharacterAndStringLiterals() {
+    #expect(lex("'A' \"text\"") == [.integer(65), .string("text"), .endOfFile])
+}
+
+@Test func lexerReadsColonDelimitedOperators() {
+    #expect(lex("1 :SHL: 2 :and: 3") == [
+        .integer(1), .operatorWord("SHL"), .integer(2),
+        .operatorWord("AND"), .integer(3), .endOfFile,
+    ])
+}
+
+@Test func lexerRejectsAnUnterminatedString() {
+    var bag = DiagnosticBag()
+    _ = Lexer(source: "\"oops").tokenize(into: &bag)
+    #expect(bag.diagnostics.map(\.code) == ["E002"])
+    #expect(bag.hasErrors)
+}
