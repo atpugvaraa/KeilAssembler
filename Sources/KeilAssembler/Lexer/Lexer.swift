@@ -78,7 +78,16 @@ struct Lexer {
                 }
                 let scalar = characters[column]
                 column += 1
-                if column < characters.count, characters[column] == "'" { column += 1 }
+                guard column < characters.count, characters[column] == "'" else {
+                    diagnostics.emit(Diagnostic(
+                        severity: .error, code: "E003",
+                        message: "unterminated character literal",
+                        range: SourceRange(line: line, column: start, length: column - start),
+                        note: nil
+                    ))
+                    continue
+                }
+                column += 1
                 tokens.append(Token(
                     kind: .integer(scalar.unicodeScalars.first.map { UInt32($0.value) } ?? 0),
                     range: SourceRange(line: line, column: start, length: column - start)
@@ -219,8 +228,18 @@ struct Lexer {
             basePrefix.append(characters[lookahead])
             lookahead += 1
         }
-        if lookahead < characters.count, characters[lookahead] == "_",
-           let radix = Int(basePrefix), (2...16).contains(radix) {
+        if lookahead < characters.count, characters[lookahead] == "_" {
+            guard let radix = Int(basePrefix), (2...16).contains(radix) else {
+                column = lookahead + 1
+                while column < characters.count, characters[column].isHexDigit { column += 1 }
+                diagnostics.emit(Diagnostic(
+                    severity: .error, code: "E005",
+                    message: "base \(basePrefix) is not valid",
+                    range: SourceRange(line: line, column: start, length: column - start),
+                    note: "bases 2 to 16 are supported"
+                ))
+                return 0
+            }
             column = lookahead + 1
             return consume(characters, from: &column, radix: radix, start: start, line: line, diagnostics: &diagnostics)
         }

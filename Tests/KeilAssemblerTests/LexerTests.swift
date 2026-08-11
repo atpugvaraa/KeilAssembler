@@ -102,3 +102,37 @@ private func lex(_ source: String) -> [Token.Kind] {
     #expect(bag.diagnostics.map(\.code) == ["E002"])
     #expect(bag.hasErrors)
 }
+
+@Test func lexerRejectsAnUnterminatedCharacterLiteral() {
+    var bag = DiagnosticBag()
+    let tokens = Lexer(source: "'A").tokenize(into: &bag)
+    #expect(bag.diagnostics.map(\.code) == ["E003"])
+    #expect(bag.hasErrors)
+    // No spurious integer token should be produced for the malformed literal.
+    #expect(tokens.map(\.kind) == [.endOfFile])
+}
+
+@Test func lexerRejectsAnOutOfRangeBase() {
+    var bag = DiagnosticBag()
+    _ = Lexer(source: "99_5").tokenize(into: &bag)
+    #expect(bag.diagnostics.map(\.code) == ["E005"])
+    #expect(bag.hasErrors)
+}
+
+@Test func lexerRejectsALoneAmpersandWithNoDigits() {
+    var bag = DiagnosticBag()
+    _ = Lexer(source: "&").tokenize(into: &bag)
+    #expect(bag.diagnostics.map(\.code) == ["E005"])
+    #expect(bag.hasErrors)
+}
+
+@Test func lexerRejectsAnUnterminatedOperatorWord() {
+    var bag = DiagnosticBag()
+    _ = Lexer(source: ":SHL").tokenize(into: &bag)
+    #expect(bag.diagnostics.map(\.code) == ["E004"])
+    #expect(bag.hasErrors)
+}
+
+@Test func lexerWraps32BitOverflowingLiterals() {
+    #expect(lex("&1FFFFFFFF") == [.integer(0xFFFFFFFF), .endOfFile])
+}
