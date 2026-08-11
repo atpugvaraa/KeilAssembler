@@ -1000,7 +1000,7 @@ git commit -m "feat: AST types for ARMASM statements, operands, and expressions"
 
 **Interfaces:**
 - Consumes: `Token`, `Lexer`, `DiagnosticBag`, all AST types.
-- Produces: `Parser(tokens: [Token])` with `func parse(into: inout DiagnosticBag) -> Program`; internal cursor helpers `peek()`, `advance()`, `match(_:)`, `expect(_:code:message:)` used by Tasks 6–8.
+- Produces: `Parser(tokens: [Token])` with `mutating func parse(into: inout DiagnosticBag) -> Program`; internal cursor helpers `peek()`, `advance()`, `match(_:)`, `skipToEndOfLine()` used by Tasks 6–8. Note `parse` is `mutating`, so callers must bind the parser to a `var` — `Parser(tokens:).parse(into:)` does not compile against an rvalue.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -1191,8 +1191,8 @@ extension Mnemonic {
     /// (`ADDEQS`), and [ARMASM] also accepts the reverse (`ADDSEQ`); both parse.
     /// Longest mnemonic wins so `LDRB` is not read as `LDR` + a bogus suffix.
     init?(parsingSuffixesOf text: String) {
-        guard Mnemonic.decompose(text) != nil else { return nil }
-        self = Mnemonic.decompose(text)!.mnemonic
+        guard let parts = Mnemonic.decompose(text) else { return nil }
+        self = parts.mnemonic
     }
 
     static func decompose(_ text: String) -> (mnemonic: Mnemonic, condition: Condition, setsFlags: Bool)? {
