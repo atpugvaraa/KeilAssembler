@@ -74,8 +74,8 @@ extension Mnemonic {
     /// (`ADDEQS`), and [ARMASM] also accepts the reverse (`ADDSEQ`); both parse.
     /// Longest mnemonic wins so `LDRB` is not read as `LDR` + a bogus suffix.
     init?(parsingSuffixesOf text: String) {
-        guard Mnemonic.decompose(text) != nil else { return nil }
-        self = Mnemonic.decompose(text)!.mnemonic
+        guard let parts = Mnemonic.decompose(text) else { return nil }
+        self = parts.mnemonic
     }
 
     static func decompose(_ text: String) -> (mnemonic: Mnemonic, condition: Condition, setsFlags: Bool)? {
