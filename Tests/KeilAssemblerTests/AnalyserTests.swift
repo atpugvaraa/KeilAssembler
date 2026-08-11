@@ -164,3 +164,211 @@ private func evaluate(_ expression: Expression, symbols: SymbolTable = SymbolTab
     symbols.labels["X"] = 2
     #expect(symbols.lookup("X") == 1)
 }
+
+// MARK: - Analyser (Task 10)
+
+private func analyse(_ source: String) -> (AnalysedProgram, DiagnosticBag) {
+    var bag = DiagnosticBag()
+    let tokens = Lexer(source: source).tokenize(into: &bag)
+    var parser = Parser(tokens: tokens)
+    let program = parser.parse(into: &bag)
+    return (Analyser.analyse(program, into: &bag), bag)
+}
+
+@Test func analyserAssignsFourBytesPerInstruction() {
+    let (analysed, bag) = analyse("""
+        AREA PROGRAM, CODE, READONLY
+        ENTRY
+    MAIN
+        MOV R1, #0x12
+        MOV R2, R1
+    """)
+    #expect(bag.hasErrors == false)
+    #expect(analysed.symbols.labels["MAIN"] == Analyser.origin)
+    // MAIN labels the first instruction; the second sits one word later.
+    let instructionAddresses = analysed.addresses.values.sorted()
+    #expect(instructionAddresses == [Analyser.origin, Analyser.origin + 4])
+}
+
+@Test func analyserBuildsADataImageFromDCD() {
+    let (analysed, bag) = analyse("""
+        AREA PROGRAM, CODE, READONLY
+        ENTRY
+    MAIN
+        MOV R1, #1
+        AREA STORAGE, DATA, READONLY
+    VALUE1 DCD &00000012
+    VALUE2 DCD &00000013
+    """)
+    #expect(bag.hasErrors == false)
+    let value1 = analysed.symbols.labels["VALUE1"]!
+    #expect(analysed.symbols.labels["VALUE2"] == value1 + 4)
+    // Little-endian, Spec §3.
+    let blob = analysed.dataImage.first { $0.address == value1 }
+    #expect(blob?.bytes == [0x12, 0x00, 0x00, 0x00])
+}
+
+@Test func analyserWarnsWhenAnAreaNameIsReused() {
+    // Spec §11 Q4: the labs declare PROGRAM as both CODE and DATA.
+    let (_, bag) = analyse("""
+        AREA PROGRAM, CODE, READONLY
+        ENTRY
+    MAIN
+        MOV R1, #1
+        AREA PROGRAM, DATA, READONLY
+    VALUE DCD &12
+    """)
+    #expect(bag.hasErrors == false)
+    #expect(bag.diagnostics.contains { $0.code == "W004" })
+}
+
+@Test func analyserRequiresExactlyOneEntry() {
+    let (_, bag) = analyse("""
+        AREA PROGRAM, CODE, READONLY
+    MAIN
+        MOV R1, #1
+    """)
+    #expect(bag.diagnostics.map(\.code).contains("E033"))
+}
+
+// MARK: - Strengthening beyond the brief
+
+@Test func analyserDiagnosesALabelReusingAnEquName() {
+    // The obligation inherited from Task 9: SymbolTable.lookup resolves constants
+    // before labels and cannot itself signal ambiguity. A wrong implementation that
+    // writes straight into `symbols.labels[...]` / `symbols.constants[...]` without
+    // cross-checking the other dictionary would let the EQU silently shadow VALUE's
+    // address with no diagnostic at all — exactly the highest-severity defect class
+    // this task exists to close.
+    let (_, bag) = analyse("""
+        AREA PROGRAM, CODE, READONLY
+        ENTRY
+    MAIN
+        MOV R1, #1
+    VALUE MOV R2, #2
+    VALUE EQU 5
+    """)
+    #expect(bag.diagnostics.map(\.code).contains("E042"))
+}
+
+@Test func analyserDiagnosesADuplicateLabel() {
+    // Duplicate names *within* one dictionary deserve the same E042 treatment.
+    // The brief's own sample code binds labels with `if symbols.labels[label] == nil`,
+    // which silently keeps the first and never reports the second — this test would
+    // catch that silent-first-wins behaviour.
+    let (_, bag) = analyse("""
+        AREA PROGRAM, CODE, READONLY
+        ENTRY
+    MAIN
+        MOV R1, #1
+    MAIN
+        MOV R2, #2
+    """)
+    #expect(bag.diagnostics.map(\.code).contains("E042"))
+}
+
+@Test func analyserDiagnosesADuplicateEqu() {
+    // Symmetric case for the constants dictionary: two EQUs with the same name.
+    // A wrong implementation that only cross-checks labels-vs-constants (and never
+    // checks constants-vs-constants) would let the second EQU overwrite the first
+    // with no diagnostic.
+    let (_, bag) = analyse("""
+        AREA PROGRAM, CODE, READONLY
+        ENTRY
+    MAIN
+        MOV R1, #1
+    SIZE EQU 4
+    SIZE EQU 8
+    """)
+    #expect(bag.diagnostics.map(\.code).contains("E042"))
+}
+
+@Test func analyserDoesNotFlagAnOrdinaryEquAsAColliding() {
+    // Guards against a false positive from the fix above: an EQU directive's own
+    // label-column symbol (Line.label carries it, same as any other statement) must
+    // not fall through into the generic position-label binding path and register
+    // itself in `symbols.labels` before pass 1b binds it as a constant — that would
+    // make every ordinary EQU miscount as a self-collision against E042.
+    let (analysed, bag) = analyse("""
+        AREA PROGRAM, CODE, READONLY
+        ENTRY
+    MAIN
+        MOV R1, #1
+    SIZE EQU 4
+        MOV R2, #1
+    """)
+    #expect(bag.hasErrors == false)
+    #expect(bag.diagnostics.map(\.code).contains("E042") == false)
+    #expect(analysed.symbols.constants["SIZE"] == 4)
+    #expect(analysed.symbols.labels["SIZE"] == nil)
+}
+
+@Test func analyserResolvesAForwardLabelReferenceInData() {
+    // Spec §5.1: "forward references are permitted." PTR's DCD value names VALUE1
+    // before VALUE1's own DCD line. A wrong implementation that evaluated data
+    // values during pass 1 (interleaved with layout) rather than deferring all
+    // evaluation to pass 2 would report VALUE1 as undefined (E031) here, because
+    // VALUE1 is not yet bound at the point PTR is laid out.
+    let (analysed, bag) = analyse("""
+        AREA PROGRAM, CODE, READONLY
+        ENTRY
+    MAIN
+        MOV R1, #1
+        AREA STORAGE, DATA, READONLY
+    PTR DCD VALUE1
+    VALUE1 DCD &00000012
+    """)
+    #expect(bag.hasErrors == false)
+    let ptr = analysed.symbols.labels["PTR"]!
+    let value1 = analysed.symbols.labels["VALUE1"]!
+    let blob = analysed.dataImage.first { $0.address == ptr }
+    let expectedBytes: [UInt8] = [
+        UInt8(truncatingIfNeeded: value1),
+        UInt8(truncatingIfNeeded: value1 >> 8),
+        UInt8(truncatingIfNeeded: value1 >> 16),
+        UInt8(truncatingIfNeeded: value1 >> 24),
+    ]
+    #expect(blob?.bytes == expectedBytes)
+}
+
+@Test func analyserInsertsRealAlignmentPaddingBeforeAFourByteDirective() {
+    // Domain rule 3: alignment happens before the label binds, and it must insert
+    // real padding, not just round the *label* up while leaving the byte cursor
+    // untouched. A wrong implementation that bound WVAL's label to the next multiple
+    // of 4 without also advancing `position` past the padding bytes (or that skipped
+    // alignment entirely and put WVAL one byte after BVAL) would fail this.
+    let (analysed, bag) = analyse("""
+        AREA PROGRAM, CODE, READONLY
+        ENTRY
+    MAIN
+        MOV R1, #1
+        AREA STORAGE, DATA, READONLY
+    BVAL DCB &FF
+    WVAL DCD &12345678
+    """)
+    #expect(bag.hasErrors == false)
+    let bval = analysed.symbols.labels["BVAL"]!
+    let wval = analysed.symbols.labels["WVAL"]!
+    #expect(bval % 4 == 0)          // STORAGE's own AREA alignment.
+    #expect(wval != bval + 1)       // Not "one byte later."
+    #expect(wval == bval + 4)       // Rounded up to the next 4-byte boundary.
+}
+
+@Test func analyserAlignZeroFromSourceDoesNotHangOrCrash() {
+    // Termination guard: `align(_:to:)` must not divide by zero or spin when the
+    // boundary is 0 or 1 — including when `ALIGN 0` reaches it straight from
+    // source, not just as a hardcoded default. A wrong implementation computing
+    // `value % boundary` without guarding `boundary <= 1` would trap here.
+    let (analysed, bag) = analyse("""
+        AREA PROGRAM, CODE, READONLY
+        ENTRY
+    MAIN
+        MOV R1, #1
+        ALIGN 0
+        MOV R2, R1
+    """)
+    #expect(bag.hasErrors == false)
+    let instructionAddresses = analysed.addresses.values.sorted()
+    // ALIGN 0 is a no-op boundary; the second MOV sits immediately after the first.
+    #expect(instructionAddresses == [Analyser.origin, Analyser.origin + 4])
+}

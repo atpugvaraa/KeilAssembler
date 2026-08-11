@@ -516,6 +516,7 @@ the row in the same commit as the code.**
 | `E039` | expected `,` between data-list values | Parser |
 | `E040` | expected `,` or end of line after operand | Parser |
 | `E041` | expected `,` between registers in a register list | Parser |
+| `E042` | a name is defined more than once, or as both a label and an EQU constant | Analyser |
 | `W001` | statement in the label column | Parser |
 | `W002` | stray `,` after a data directive | Parser |
 | `W003` | `AREA` attribute ignored | Parser |
@@ -524,7 +525,7 @@ the row in the same commit as the code.**
 | `W011` | unaligned access not modelled (§9 D4) | Analyser |
 | `W012` | shift amount ≥ 32 (§9 D8) | Analyser |
 
-Next free error code: `E042`. Next free warning code: `W005` (or `W013` in the deviation band).
+Next free error code: `E043`. Next free warning code: `W005` (or `W013` in the deviation band).
 
 ## 9. Deviations from real ARM7
 
