@@ -444,3 +444,143 @@ private func firstInstruction(_ source: String) -> Instruction? {
     #expect(program.lines.count == 1)
     #expect(firstInstruction("    MOV R1 LABEL\n")?.operands == [.register(1)])
 }
+
+// MARK: - Task 8: addressing modes, the three LDR forms, and register lists
+
+@Test func parserReadsTheThreeLDRFormsDistinctly() {
+    // Spec §7.6: these must not be conflated.
+    #expect(firstInstruction("    LDR R1, VALUE\n")?.operands == [
+        .register(1), .address(.label("VALUE")),
+    ])
+    #expect(firstInstruction("    LDR R1, =0x3000F000\n")?.operands == [
+        .register(1), .immediateValue(.integer(0x3000_F000)),
+    ])
+    #expect(firstInstruction("    ADR R1, VALUE\n")?.operands == [
+        .register(1), .labelReference("VALUE"),
+    ])
+}
+
+@Test func parserReadsIndirectAndOffsetAddressing() {
+    #expect(firstInstruction("    LDR R3, [R1]\n")?.operands == [
+        .register(3),
+        .address(.immediateOffset(base: 1, offset: nil, negated: false, writeBack: false)),
+    ])
+    #expect(firstInstruction("    LDR R3, [R1, #4]\n")?.operands == [
+        .register(3),
+        .address(.immediateOffset(base: 1, offset: .integer(4), negated: false, writeBack: false)),
+    ])
+    #expect(firstInstruction("    STR R3, [R1, #-8]!\n")?.operands == [
+        .register(3),
+        .address(.immediateOffset(base: 1, offset: .integer(8), negated: true, writeBack: true)),
+    ])
+    #expect(firstInstruction("    LDR R3, [R1], #4\n")?.operands == [
+        .register(3),
+        .address(.postIndexed(base: 1, offset: .integer(4), negated: false)),
+    ])
+}
+
+@Test func parserReadsScaledRegisterOffsets() {
+    #expect(firstInstruction("    LDR R3, [R1, R2, LSL #2]\n")?.operands == [
+        .register(3),
+        .address(.registerOffset(
+            base: 1, offset: 2, negated: false,
+            shift: ShiftSpec(kind: .lsl, amount: .integer(2)), writeBack: false
+        )),
+    ])
+}
+
+@Test func parserReadsRegisterLists() {
+    #expect(firstInstruction("    PUSH {R1, R4, R14}\n")?.operands == [.registerList([1, 4, 14])])
+}
+
+// MARK: - Strengthening beyond the brief
+
+@Test func parserNormalisesRegisterListOrderRegardlessOfSourceOrder() {
+    // Spec §6.3: register lists are stored lowest-register-at-lowest-address, so the order
+    // written in source must not matter. A wrong implementation that preserved source order
+    // would make these two different, even though ARM7 treats them identically.
+    #expect(firstInstruction("    PUSH {R4, R1}\n")?.operands == [.registerList([1, 4])])
+    #expect(firstInstruction("    PUSH {R1, R4}\n")?.operands == [.registerList([1, 4])])
+}
+
+@Test func parserDistinguishesPreIndexFromPostIndexAddressing() {
+    // Domain rule: `[Rn, #4]!` (pre-index, writeback before access) and `[Rn], #4`
+    // (post-index, writeback after access) must land in different AddressMode cases for the
+    // same offset — a shared "writeBack: Bool" flag on one shape would conflate them.
+    let pre = firstInstruction("    LDR R1, [R2, #4]!\n")?.operands.last
+    let post = firstInstruction("    LDR R1, [R2], #4\n")?.operands.last
+    #expect(pre == .address(.immediateOffset(base: 2, offset: .integer(4), negated: false, writeBack: true)))
+    #expect(post == .address(.postIndexed(base: 2, offset: .integer(4), negated: false)))
+    #expect(pre != post)
+}
+
+// MARK: - Task 8: termination invariant traces
+
+@Test func parserDoesNotHangOnAnUnclosedAddressBracket() {
+    let (program, bag) = parse("    LDR R1, [\n")
+    #expect(bag.diagnostics.map(\.code) == ["E022"])
+    #expect(program.lines.count == 1)
+}
+
+@Test func parserDoesNotHangOnAnAddressBracketMissingItsClose() {
+    let (program, bag) = parse("    LDR R1, [R2\n")
+    #expect(bag.diagnostics.map(\.code) == ["E024"])
+    #expect(program.lines.count == 1)
+}
+
+@Test func parserDoesNotHangOnATrailingCommaInsideAnAddressBracket() {
+    let (program, bag) = parse("    LDR R1, [R2,\n")
+    #expect(bag.diagnostics.map(\.code) == ["E026"])
+    #expect(program.lines.count == 1)
+}
+
+@Test func parserDoesNotHangOnAHashOffsetWithNoExpression() {
+    let (program, bag) = parse("    LDR R1, [R2, #]\n")
+    #expect(bag.diagnostics.map(\.code) == ["E016"])
+    #expect(program.lines.count == 1)
+}
+
+@Test func parserDoesNotHangOnARegisterOffsetShiftWithNoAmount() {
+    let (program, bag) = parse("    LDR R1, [R2, R3, LSL]\n")
+    #expect(bag.diagnostics.map(\.code) == ["E028"])
+    #expect(program.lines.count == 1)
+}
+
+@Test func parserDoesNotHangOnAnUnclosedRegisterListBrace() {
+    let (program, bag) = parse("    PUSH {\n")
+    #expect(bag.diagnostics.map(\.code) == ["E029"])
+    #expect(program.lines.count == 1)
+}
+
+@Test func parserDoesNotHangOnAnEmptyRegisterList() {
+    let (program, bag) = parse("    PUSH {}\n")
+    #expect(bag.diagnostics.map(\.code) == ["E029"])
+    #expect(program.lines.count == 1)
+}
+
+@Test func parserDoesNotHangOnARegisterListMissingItsClose() {
+    let (program, bag) = parse("    PUSH {R1\n")
+    #expect(bag.diagnostics.map(\.code) == ["E030"])
+    #expect(program.lines.count == 1)
+}
+
+@Test func parserDiagnosesARegisterListMissingACommaBetweenRegisters() {
+    // Same defect class as Task 6's DCD fix and Task 7's operand-list fix: the
+    // `while match(.comma)` loop treats "no comma follows R1" as "the list is done," and
+    // without a targeted check the only thing that catches it is the generic "expected '}'"
+    // guard — which misnames a missing-comma error as a missing-brace one. A wrong
+    // implementation would either silently yield `[1]` (dropping R4 entirely) or report only
+    // the generic E030, not the register-list-specific E041 that names the real problem.
+    let (program, bag) = parse("    PUSH {R1 R4}\n")
+    #expect(bag.diagnostics.map(\.code) == ["E041"])
+    #expect(program.lines.count == 1)
+    // The failed register list must not surface as a partial `[1]` operand — parsing the
+    // whole instruction's operand list aborts instead of keeping a truncated list.
+    #expect(firstInstruction("    PUSH {R1 R4}\n")?.operands == [])
+}
+
+@Test func parserDoesNotHangOnARegisterListWithATrailingComma() {
+    let (program, bag) = parse("    PUSH {R1,}\n")
+    #expect(bag.diagnostics.map(\.code) == ["E029"])
+    #expect(program.lines.count == 1)
+}

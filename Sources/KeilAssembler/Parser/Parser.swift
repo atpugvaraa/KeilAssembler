@@ -580,15 +580,170 @@ struct Parser {
         return nil
     }
 
-    // MARK: - Stubs for Task 8
+    // MARK: - Addressing modes and register lists (Spec §6.3)
 
+    /// Spec §6.3 addressing modes.
     private mutating func parseAddressMode(into diagnostics: inout DiagnosticBag) -> AddressMode? {
-        skipToEndOfLine()
-        return nil
+        guard match(.leftBracket) else { return nil }
+
+        guard case .register(let base) = peek() else {
+            diagnostics.emit(Diagnostic(
+                severity: .error, code: "E022",
+                message: "expected a base register after '['",
+                range: current.range, note: nil
+            ))
+            return nil
+        }
+        advance()
+
+        // `[Rn]` and `[Rn], #off`
+        if match(.rightBracket) {
+            guard match(.comma) else {
+                return .immediateOffset(base: base, offset: nil, negated: false, writeBack: false)
+            }
+            // The sign lives inside the immediate, after '#' (`#-8`), not before it — unlike
+            // the register-offset form (`-Rm`), where it is the only place a sign can go
+            // since a register token cannot carry one itself.
+            guard match(.hash) else {
+                diagnostics.emit(Diagnostic(
+                    severity: .error, code: "E023",
+                    message: "expected a post-indexed offset",
+                    range: current.range, note: "write `[Rn], #4`"
+                ))
+                return nil
+            }
+            let negated = parseOffsetSign()
+            guard let offset = parseExpression(into: &diagnostics) else { return nil }
+            return .postIndexed(base: base, offset: offset, negated: negated)
+        }
+
+        guard match(.comma) else {
+            diagnostics.emit(Diagnostic(
+                severity: .error, code: "E024",
+                message: "expected ',' or ']'",
+                range: current.range, note: nil
+            ))
+            return nil
+        }
+
+        // `[Rn, #±off]{!}`
+        if match(.hash) {
+            let negated = parseOffsetSign()
+            guard let offset = parseExpression(into: &diagnostics) else { return nil }
+            guard match(.rightBracket) else {
+                diagnostics.emit(Diagnostic(
+                    severity: .error, code: "E025",
+                    message: "expected ']'",
+                    range: current.range, note: nil
+                ))
+                return nil
+            }
+            let writeBack = match(.bang)
+            return .immediateOffset(base: base, offset: offset, negated: negated, writeBack: writeBack)
+        }
+
+        // `[Rn, ±Rm{, <shift> #k}]{!}` — the sign, if any, precedes the register directly.
+        let negated = parseOffsetSign()
+        guard case .register(let offsetRegister) = peek() else {
+            diagnostics.emit(Diagnostic(
+                severity: .error, code: "E026",
+                message: "expected an offset register or '#'",
+                range: current.range, note: nil
+            ))
+            return nil
+        }
+        advance()
+
+        var shift: ShiftSpec?
+        if match(.comma) {
+            guard case .symbol(let word) = peek(), let kind = ShiftKind(text: word) else {
+                diagnostics.emit(Diagnostic(
+                    severity: .error, code: "E027",
+                    message: "expected a shift after the offset register",
+                    range: current.range, note: nil
+                ))
+                return nil
+            }
+            advance()
+            if kind == .rrx {
+                shift = ShiftSpec(kind: .rrx)
+            } else {
+                guard match(.hash), let amount = parseExpression(into: &diagnostics) else {
+                    diagnostics.emit(Diagnostic(
+                        severity: .error, code: "E028",
+                        message: "a scaled register offset needs an immediate shift amount",
+                        range: current.range, note: "write `[Rn, Rm, LSL #2]`"
+                    ))
+                    return nil
+                }
+                shift = ShiftSpec(kind: kind, amount: amount)
+            }
+        }
+
+        guard match(.rightBracket) else {
+            diagnostics.emit(Diagnostic(
+                severity: .error, code: "E025",
+                message: "expected ']'",
+                range: current.range, note: nil
+            ))
+            return nil
+        }
+        let writeBack = match(.bang)
+        return .registerOffset(
+            base: base, offset: offsetRegister, negated: negated,
+            shift: shift, writeBack: writeBack
+        )
     }
 
+    private mutating func parseOffsetSign() -> Bool {
+        if match(.minus) { return true }
+        _ = match(.plus)
+        return false
+    }
+
+    /// `{r1, r4}` register list. Spec §6.3: lists are stored lowest-register-at-lowest-address
+    /// regardless of the order written, so the result is sorted before Task 16's lowering
+    /// walks it.
     private mutating func parseRegisterList(into diagnostics: inout DiagnosticBag) -> [Int]? {
-        skipToEndOfLine()
-        return nil
+        guard match(.leftBrace) else { return nil }
+        var registers: [Int] = []
+        repeat {
+            guard case .register(let number) = peek() else {
+                diagnostics.emit(Diagnostic(
+                    severity: .error, code: "E029",
+                    message: "expected a register in the list",
+                    range: current.range, note: nil
+                ))
+                return nil
+            }
+            advance()
+            registers.append(number)
+        } while match(.comma)
+
+        // As with data lists (E039) and instruction operands (E040): the loop above only
+        // re-enters on a comma, so "the next token isn't a comma" reads as "the list is
+        // done." A '}' here means it really is done. Anything else that is itself another
+        // register (e.g. `{R1 R4}`, where R4 directly follows R1 with no separating comma)
+        // means a register was about to be silently dropped from the list — diagnose that
+        // distinctly (E041) rather than letting it fall through to the generic "expected '}'"
+        // below, which would misname a missing-comma error as a missing-brace one.
+        if case .register = peek() {
+            diagnostics.emit(Diagnostic(
+                severity: .error, code: "E041",
+                message: "expected ',' between registers in the list",
+                range: current.range, note: nil
+            ))
+            return nil
+        }
+
+        guard match(.rightBrace) else {
+            diagnostics.emit(Diagnostic(
+                severity: .error, code: "E030",
+                message: "expected '}'",
+                range: current.range, note: nil
+            ))
+            return nil
+        }
+        return registers.sorted()
     }
 }
