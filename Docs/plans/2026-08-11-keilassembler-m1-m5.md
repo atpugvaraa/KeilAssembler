@@ -1143,12 +1143,14 @@ struct Parser {
             return Line(label: label, statement: nil, range: startRange)
         }
 
-        let statement = parseStatement(into: &diagnostics)
+        // The label is threaded through because `sym EQU expr` binds the label as the
+        // constant's name — it is the one directive whose meaning depends on it.
+        let statement = parseStatement(label: label, into: &diagnostics)
         return Line(label: label, statement: statement, range: startRange)
     }
 
     /// Filled in by Tasks 6–8. Returns nil and consumes the line when nothing parses.
-    private mutating func parseStatement(into diagnostics: inout DiagnosticBag) -> Statement? {
+    private mutating func parseStatement(label: String?, into diagnostics: inout DiagnosticBag) -> Statement? {
         guard case .symbol(let text) = peek() else {
             diagnostics.emit(Diagnostic(
                 severity: .error, code: "E006",
@@ -1230,7 +1232,7 @@ extension Mnemonic {
 Tasks 6 and 7 replace these. Add to `Parser.swift`:
 
 ```swift
-    private mutating func parseDirective(into diagnostics: inout DiagnosticBag) -> Statement? {
+    private mutating func parseDirective(label: String?, into diagnostics: inout DiagnosticBag) -> Statement? {
         skipToEndOfLine()
         return nil
     }
@@ -1328,7 +1330,7 @@ Expected: FAIL — `parseDirective` returns nil, so `statement` is nil.
 - [ ] **Step 3: Replace `parseDirective` in `Parser.swift`**
 
 ```swift
-    private mutating func parseDirective(into diagnostics: inout DiagnosticBag) -> Statement? {
+    private mutating func parseDirective(label: String?, into diagnostics: inout DiagnosticBag) -> Statement? {
         guard case .symbol(let text) = peek() else { return nil }
         let range = current.range
         advance()
@@ -1337,6 +1339,21 @@ Expected: FAIL — `parseDirective` returns nil, so `statement` is nil.
         case "ENTRY":  return .directive(.entry)
         case "END":    return .directive(.end)
         case "LTORG":  return .directive(.ltorg)
+
+        case "EQU":
+            // `sym EQU expr` names the constant with the line's label, so EQU is the
+            // one directive whose meaning depends on the label having been parsed.
+            guard let symbol = label else {
+                diagnostics.emit(Diagnostic(
+                    severity: .error, code: "E017",
+                    message: "EQU requires a preceding label",
+                    range: range, note: "write `SYM EQU expr`"
+                ))
+                skipToEndOfLine()
+                return nil
+            }
+            guard let value = parseExpression(into: &diagnostics) else { return nil }
+            return .directive(.equ(symbol: symbol, value: value))
 
         case "EXPORT", "GLOBAL":
             guard case .symbol(let name) = peek() else {
@@ -1751,7 +1768,7 @@ Expected: FAIL — the stub returns an instruction with `operands == []`.
         }
 
         diagnostics.emit(Diagnostic(
-            severity: .error, code: "E017",
+            severity: .error, code: "E038",
             message: "expected an operand",
             range: current.range, note: nil
         ))
