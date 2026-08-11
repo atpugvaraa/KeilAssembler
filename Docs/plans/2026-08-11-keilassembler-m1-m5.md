@@ -534,6 +534,23 @@ Append to `Tests/KeilAssemblerTests/LexerTests.swift`:
     #expect(bag.diagnostics.map(\.code) == ["E002"])
     #expect(bag.hasErrors)
 }
+
+@Test func lexerRejectsMalformedLiteralsRatherThanInventingValues() {
+    // PRD S3: every one of these must diagnose, not silently produce a token.
+    func codes(_ source: String) -> [String] {
+        var bag = DiagnosticBag()
+        _ = Lexer(source: source).tokenize(into: &bag)
+        return bag.diagnostics.map(\.code)
+    }
+    #expect(codes("'A") == ["E003"])        // would otherwise yield .integer(65)
+    #expect(codes("99_5") == ["E005"])      // would otherwise yield .integer(995)
+    #expect(codes("&") == ["E005"])         // lone ampersand, no digits
+    #expect(codes(":SHL") == ["E004"])      // no closing colon
+}
+
+@Test func lexerWrapsLiteralsWiderThan32Bits() {
+    #expect(lex("&1FFFFFFFF") == [.integer(0xFFFF_FFFF), .endOfFile])
+}
 ```
 
 - [ ] **Step 2: Run the test to verify it fails**
@@ -570,7 +587,18 @@ Insert these branches in `scan`, immediately **before** the `punctuation` lookup
                 }
                 let scalar = characters[column]
                 column += 1
-                if column < characters.count, characters[column] == "'" { column += 1 }
+                // An unterminated character literal must not yield a value: PRD S3
+                // makes silently emitting wrong output the highest-severity defect.
+                guard column < characters.count, characters[column] == "'" else {
+                    diagnostics.emit(Diagnostic(
+                        severity: .error, code: "E003",
+                        message: "unterminated character literal",
+                        range: SourceRange(line: line, column: start, length: column - start),
+                        note: "add a closing single quote"
+                    ))
+                    continue
+                }
+                column += 1
                 tokens.append(Token(
                     kind: .integer(scalar.unicodeScalars.first.map { UInt32($0.value) } ?? 0),
                     range: SourceRange(line: line, column: start, length: column - start)
@@ -660,8 +688,21 @@ Add the number scanner as a private method:
             basePrefix.append(characters[lookahead])
             lookahead += 1
         }
-        if lookahead < characters.count, characters[lookahead] == "_",
-           let radix = Int(basePrefix), (2...16).contains(radix) {
+        if lookahead < characters.count, characters[lookahead] == "_" {
+            // An underscore means the author declared a base. If that base is out of
+            // range the literal is malformed — it must not fall through to the decimal
+            // path, which would silently reinterpret `99_5` as 995 (PRD S3).
+            guard let radix = Int(basePrefix), (2...16).contains(radix) else {
+                column = lookahead + 1
+                while column < characters.count, characters[column].isHexDigit { column += 1 }
+                diagnostics.emit(Diagnostic(
+                    severity: .error, code: "E005",
+                    message: "base \(basePrefix) is not valid",
+                    range: SourceRange(line: line, column: start, length: column - start),
+                    note: "bases 2 to 16 are supported"
+                ))
+                return 0
+            }
             column = lookahead + 1
             return consume(characters, from: &column, radix: radix, start: start, line: line, diagnostics: &diagnostics)
         }
