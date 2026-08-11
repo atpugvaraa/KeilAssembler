@@ -402,23 +402,172 @@ struct Parser {
         "SHL": .shiftLeft, "SHR": .shiftRight,
     ]
 
-    // MARK: - Stub for Task 7
+    // MARK: - Instructions (Spec §6)
 
-    /// Stub: Task 7 replaces this with real operand parsing. Consumes just the
-    /// mnemonic token, builds an `Instruction` with no operands, and skips the
-    /// rest of the line.
     private mutating func parseInstruction(into diagnostics: inout DiagnosticBag) -> Statement? {
         guard case .symbol(let text) = peek(),
               let parts = Mnemonic.decompose(text) else { return nil }
         let range = current.range
         advance()
-        skipToEndOfLine()
+
+        var operands: [Operand] = []
+        if peek() != .endOfLine, peek() != .endOfFile {
+            repeat {
+                guard let operand = parseOperand(for: parts.mnemonic, into: &diagnostics) else {
+                    skipToEndOfLine()
+                    break
+                }
+                operands.append(operand)
+            } while match(.comma)
+        }
+
         return .instruction(Instruction(
             mnemonic: parts.mnemonic,
             condition: parts.condition,
             setsFlags: parts.setsFlags,
-            operands: [],
+            operands: operands,
             range: range
         ))
+    }
+
+    private mutating func parseOperand(
+        for mnemonic: Mnemonic,
+        into diagnostics: inout DiagnosticBag
+    ) -> Operand? {
+        // `LDR Rd, =expr` — Spec §7.6 pseudo-instruction.
+        if match(.equals) {
+            guard let value = parseExpression(into: &diagnostics) else { return nil }
+            return .immediateValue(value)
+        }
+
+        // `[Rn, ...]` and `[Rn], #off` — Task 8.
+        if peek() == .leftBracket {
+            guard let mode = parseAddressMode(into: &diagnostics) else { return nil }
+            return .address(mode)
+        }
+
+        // `{r1, r4}` register list — Task 8.
+        if peek() == .leftBrace {
+            guard let list = parseRegisterList(into: &diagnostics) else { return nil }
+            return .registerList(list)
+        }
+
+        // A bare register is either a destination/source register (more operands follow) or
+        // Operand2 itself — the trailing operand, which may carry a `, <shift> ...` clause
+        // (Spec §6.2). `registerIsTrailingOperand2` tells those apart; `parseOperand2` reads
+        // whichever of immediate/register/shifted-register it turns out to be.
+        if case .register(let number) = peek() {
+            if registerIsTrailingOperand2() {
+                guard let operand2 = parseOperand2(into: &diagnostics) else { return nil }
+                return .operand2(operand2)
+            }
+            advance()
+            return .register(number)
+        }
+
+        if peek() == .hash {
+            guard let operand2 = parseOperand2(into: &diagnostics) else { return nil }
+            return .operand2(operand2)
+        }
+
+        // A bare symbol: `B label`, `BL label`, `ADR Rd, label`, `LDR Rd, label`.
+        if case .symbol(let name) = peek() {
+            advance()
+            switch mnemonic {
+            case .b, .bl, .adr:
+                return .labelReference(name)
+            case .ldr, .str, .ldrb, .strb, .ldrh, .strh:
+                return .address(.label(name))
+            default:
+                return .labelReference(name)
+            }
+        }
+
+        diagnostics.emit(Diagnostic(
+            severity: .error, code: "E038",
+            message: "expected an operand",
+            range: current.range, note: nil
+        ))
+        return nil
+    }
+
+    /// True when the register at the cursor is Operand2 itself (Spec §6.2) rather than a
+    /// preceding destination/base register. Operand2's own shift clause is introduced by a
+    /// comma (`R1, LSL #2`), the same token that separates two distinct operands (`R1, R2`),
+    /// so this looks one token past that comma to tell which case it is. With no comma at
+    /// all, the register is the last token in the operand list, so it is Operand2 too
+    /// (`ADD R4, R1, R2`'s trailing `R2`, or a bare `MOV Rd, Rm`).
+    private func registerIsTrailingOperand2() -> Bool {
+        switch peek(1) {
+        case .comma:
+            guard case .symbol(let word) = peek(2) else { return false }
+            return ShiftKind(text: word) != nil
+        case .symbol(let word):
+            return ShiftKind(text: word) != nil
+        default:
+            return true
+        }
+    }
+
+    /// Spec §6.2.
+    mutating func parseOperand2(into diagnostics: inout DiagnosticBag) -> Operand2? {
+        if match(.hash) {
+            guard let value = parseExpression(into: &diagnostics) else { return nil }
+            return .immediate(value)
+        }
+
+        guard case .register(let number) = peek() else {
+            diagnostics.emit(Diagnostic(
+                severity: .error, code: "E018",
+                message: "expected a register or an immediate",
+                range: current.range, note: nil
+            ))
+            return nil
+        }
+        advance()
+
+        // `Rm, <shift> ...` — the comma before a shift clause (Spec §6.2). Only consumed
+        // when a shift keyword actually follows, so a plain trailing register (no shift)
+        // never eats a comma that belongs to something else.
+        if case .comma = peek(), case .symbol(let word) = peek(1), ShiftKind(text: word) != nil {
+            advance()
+        }
+
+        guard case .symbol(let word) = peek(), let kind = ShiftKind(text: word) else {
+            return .register(number)
+        }
+        advance()
+
+        if kind == .rrx {
+            return .shifted(register: number, shift: ShiftSpec(kind: .rrx))
+        }
+        if match(.hash) {
+            guard let amount = parseExpression(into: &diagnostics) else { return nil }
+            return .shifted(register: number, shift: ShiftSpec(kind: kind, amount: amount))
+        }
+        if case .register(let shiftRegister) = peek() {
+            advance()
+            return .shifted(register: number, shift: ShiftSpec(kind: kind, amountRegister: shiftRegister))
+        }
+
+        diagnostics.emit(Diagnostic(
+            severity: .error, code: "E019",
+            message: "\(word.uppercased()) needs a shift amount",
+            range: current.range,
+            note: "write `\(word.uppercased()) #n` or `\(word.uppercased()) Rs`"
+        ))
+        return nil
+    }
+
+    // MARK: - Stubs for Task 8
+
+    private mutating func parseAddressMode(into diagnostics: inout DiagnosticBag) -> AddressMode? {
+        skipToEndOfLine()
+        return nil
+    }
+
+    private mutating func parseRegisterList(into diagnostics: inout DiagnosticBag) -> [Int]? {
+        skipToEndOfLine()
+        return nil
     }
 }

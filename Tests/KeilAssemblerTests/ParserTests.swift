@@ -292,3 +292,131 @@ func parse(_ source: String) -> (Program, DiagnosticBag) {
     ])))
     #expect(program.lines.count == 1)
 }
+
+// MARK: - Task 7: instructions and Operand2
+
+private func firstInstruction(_ source: String) -> Instruction? {
+    let (program, _) = parse(source)
+    guard case .instruction(let instruction)? = program.lines.first?.statement else { return nil }
+    return instruction
+}
+
+@Test func parserReadsAnImmediateMove() {
+    let instruction = firstInstruction("    MOV R1, #0x12\n")
+    #expect(instruction?.mnemonic == .mov)
+    #expect(instruction?.condition == .al)
+    #expect(instruction?.setsFlags == false)
+    #expect(instruction?.operands == [.register(1), .operand2(.immediate(.integer(0x12)))])
+}
+
+@Test func parserReadsAThreeOperandAdd() {
+    let instruction = firstInstruction("    ADD R4, R1, R2\n")
+    #expect(instruction?.operands == [.register(4), .register(1), .operand2(.register(2))])
+}
+
+@Test func parserKeepsShiftsInOperand2NotInTheMnemonic() {
+    // Spec §6.2: MOV R3, R1, LSL #2 is MOV with a shifted second operand.
+    let instruction = firstInstruction("    MOV R3, R1, LSL #2\n")
+    #expect(instruction?.mnemonic == .mov)
+    #expect(instruction?.operands == [
+        .register(3),
+        .operand2(.shifted(register: 1, shift: ShiftSpec(kind: .lsl, amount: .integer(2)))),
+    ])
+}
+
+@Test func parserSplitsConditionAndFlagSuffixes() {
+    #expect(firstInstruction("    MOVS R3, #0\n")?.setsFlags == true)
+    #expect(firstInstruction("    MOVEQ R3, R1\n")?.condition == .eq)
+    let both = firstInstruction("    ADDEQS R1, R2, R3\n")
+    #expect(both?.mnemonic == .add)
+    #expect(both?.condition == .eq)
+    #expect(both?.setsFlags == true)
+}
+
+@Test func parserReadsShiftByRegister() {
+    let instruction = firstInstruction("    MOV R3, R1, LSR R2\n")
+    #expect(instruction?.operands == [
+        .register(3),
+        .operand2(.shifted(register: 1, shift: ShiftSpec(kind: .lsr, amountRegister: 2))),
+    ])
+}
+
+// MARK: - Strengthening beyond the brief
+
+@Test func parserDecomposesLongestMatchingMnemonicNotAShorterPrefix() {
+    // If `Mnemonic.decompose` (or its use here) picked the shorter prefix "LDR" first and
+    // treated the trailing "B"/"H" as a condition/flag suffix, this would misparse the
+    // mnemonic entirely (and likely fail to parse at all, since "B"/"H" alone are not valid
+    // suffixes). LDRB/STRH must come through as themselves, unconditional, no flags.
+    let ldrb = firstInstruction("    LDRB R1, R2\n")
+    #expect(ldrb?.mnemonic == .ldrb)
+    #expect(ldrb?.condition == .al)
+    #expect(ldrb?.setsFlags == false)
+
+    let strh = firstInstruction("    STRH R1, R2\n")
+    #expect(strh?.mnemonic == .strh)
+    #expect(strh?.condition == .al)
+    #expect(strh?.setsFlags == false)
+}
+
+@Test func parserCombinesConditionFlagSuffixAndShiftedOperand() {
+    // Exercises suffix-splitting and Operand2 shift parsing together: a wrong implementation
+    // that gets each piece right in isolation (per the other tests) could still fail here if,
+    // say, the shift lookahead only fires for the unconditional/unflagged spelling.
+    let instruction = firstInstruction("    ADDEQS R1, R2, R3, LSL #4\n")
+    #expect(instruction?.mnemonic == .add)
+    #expect(instruction?.condition == .eq)
+    #expect(instruction?.setsFlags == true)
+    #expect(instruction?.operands == [
+        .register(1),
+        .register(2),
+        .operand2(.shifted(register: 3, shift: ShiftSpec(kind: .lsl, amount: .integer(4)))),
+    ])
+}
+
+// MARK: - Task 7: termination invariant traces
+
+@Test func parserDoesNotHangOnAnInstructionWithNoOperands() {
+    // No tokens follow the mnemonic before end of line, so the operand loop is never
+    // entered at all — a zero-operand instruction like `NOP` is legitimate, not an error.
+    let (program, bag) = parse("    MOV\n")
+    #expect(bag.diagnostics.isEmpty)
+    #expect(firstInstruction("    MOV\n")?.operands == [])
+    #expect(program.lines.count == 1)
+}
+
+@Test func parserDoesNotHangOnATrailingComma() {
+    let (program, bag) = parse("    MOV R1,\n")
+    #expect(bag.diagnostics.map(\.code) == ["E038"])
+    #expect(program.lines.count == 1)
+}
+
+@Test func parserDoesNotHangOnADoubledComma() {
+    let (program, bag) = parse("    MOV R1, , R2\n")
+    #expect(bag.diagnostics.map(\.code) == ["E038"])
+    #expect(program.lines.count == 1)
+}
+
+@Test func parserDoesNotHangOnAHashWithNoExpression() {
+    let (program, bag) = parse("    MOV R1, #\n")
+    #expect(bag.diagnostics.map(\.code) == ["E016"])
+    #expect(program.lines.count == 1)
+}
+
+@Test func parserDoesNotHangOnAShiftWithNoAmount() {
+    let (program, bag) = parse("    MOV R3, R1, LSL\n")
+    #expect(bag.diagnostics.map(\.code) == ["E019"])
+    #expect(program.lines.count == 1)
+}
+
+@Test func parserDoesNotHangOnAShiftHashWithNoAmount() {
+    let (program, bag) = parse("    MOV R3, R1, LSL #\n")
+    #expect(bag.diagnostics.map(\.code) == ["E016"])
+    #expect(program.lines.count == 1)
+}
+
+@Test func parserDoesNotHangOnABareUnexpectedOperandToken() {
+    let (program, bag) = parse("    MOV R1, )\n")
+    #expect(bag.diagnostics.map(\.code) == ["E038"])
+    #expect(program.lines.count == 1)
+}
