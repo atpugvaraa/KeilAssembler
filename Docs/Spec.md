@@ -39,7 +39,7 @@ normalisation happens at or after analysis.
 - **CPSR.** N, Z, C, V only, at their architectural bit positions 31–28. Mode bits, I/F, and T
   are not modelled.
 - **Memory.** Flat, little-endian, byte-addressed, `0x00000000`–`0xFFFFFFFF`, all readable and
-  writable. Reset value of every byte is zero.
+  writable. Every byte is zero except where the startup image (§5.3) supplies contents.
 - **Reset state.** All registers zero except SP = `ARM7_STACK_TOP` (default `0x00100000`,
   full-descending). CPSR = 0.
 
@@ -109,8 +109,39 @@ instruction. Those addresses are what appear in the PC field, in the memory brow
 `ADR` / `LDR Rd, label` results.
 
 The contents of `DATA` areas form the **data image**: a list of `(arm7Address, bytes)` blobs
-emitted into the binary and copied into ARM7 memory by the runtime at startup. `CODE` areas are
-*not* present in ARM7 memory — see §9 D3.
+written to the startup image file (§5.3) and copied into ARM7 memory by the runtime at startup.
+`CODE` areas are *not* present in ARM7 memory — see §9 D3.
+
+### 5.3 The startup image
+
+ARM7 memory is initialised from a single sidecar file, `image.bin`, read by the runtime at
+startup (§7.8). It is a concatenation of blobs:
+
+```
+blob := u32 arm7Address · u32 byteCount · byteCount bytes · zero-pad to a 4-byte boundary
+```
+
+The file has two parts, applied in order:
+
+1. **Data image** — emitted by the compiler from the `DATA` areas (§5.2).
+2. **Preload image** — supplied by the client, not by the source.
+
+Later blobs overwrite earlier ones, so a preload entry wins over a `DCD` at the same address.
+
+The preload image is how the lab's memory contents are set. Exercises such as 1(d) load from
+`0x00001000` and `0x00001004` without any source construct placing values there; in µVision
+those cells are typed into the Memory window before running. The preload image is the same
+input, expressed as data:
+
+```swift
+public struct MemoryPreload: Sendable {
+    public var entries: [(address: UInt32, bytes: [UInt8])]
+}
+```
+
+It is an input to *running*, not to *compiling*. Because it is a separate file, changing a
+memory value does not require re-emitting or re-linking anything — the app's memory editor
+rewrites `image.bin` and re-runs. Tests supply it in the same way, as a literal.
 
 ## 6. Instructions
 
@@ -355,7 +386,7 @@ run-to-line are all views over the decoded trace array. No debugger is involved.
 
 Three entry points, plus one BSS symbol:
 
-- `void *armd_init(void)` — `mmap(NULL, 4 GiB, PROT_READ|PROT_WRITE, MAP_ANON|MAP_PRIVATE|MAP_NORESERVE, -1, 0)`, copy the data image blobs to their ARM7 addresses, set `armd_state.r[13] = ARM7_STACK_TOP`, open `trace.bin`, return the base.
+- `void *armd_init(void)` — `mmap(NULL, 4 GiB, PROT_READ|PROT_WRITE, MAP_ANON|MAP_PRIVATE|MAP_NORESERVE, -1, 0)`, read `image.bin` and copy each blob to its ARM7 address in file order (§5.3), set `armd_state.r[13] = ARM7_STACK_TOP`, open `trace.bin`, return the base. A missing `image.bin` is not an error; memory is simply all zero.
 - `void armd_trace(uint32_t line, uint32_t storeAddr, uint32_t storeWidth)` — append a record.
 - `void armd_fini(void)` — flush and close.
 - `struct ARMdState armd_state;`
@@ -392,14 +423,17 @@ Larmd_exit:
         ldp     x27, x28, [sp], #16
         ldp     x29, x30, [sp], #16
         ret
-
-        .section __DATA,__const
-_armd_data_image:
-        ; (arm7Address, length, bytes...) blobs
 ```
+
+There is no data section: ARM7 memory contents live in `image.bin` (§5.3), not in the
+executable. The emitted assembly is code only.
 
 Build: `clang -c armd_rt.c` · `clang -c out.s` · `clang -o program out.o armd_rt.o`. No linker
 script, no custom segments, no entitlements.
+
+**Run directory.** `armd_init` and `armd_fini` resolve `image.bin` and `trace.bin` relative to
+the working directory. Each run gets its own directory containing the executable, the image, and
+the trace, so runs never collide and a run is fully reproducible from its directory alone.
 
 ## 8. Diagnostics
 
@@ -455,7 +489,8 @@ register state and, where relevant, memory.
 | `1a` | `MOV R1,#0x12` · `MOV R2,R1` · `MOV R3,R1` | R1=R2=R3=`0x00000012` |
 | `1b` | `MOV R1,#0x12` · `MOV R2,#0x15` · `ADD R4,R1,R2` | R4=`0x00000027` |
 | `1c` | `LDR R1,VALUE1` · `LDR R2,VALUE2` · `ADD R3,R1,R2`; `VALUE1 DCD &12`, `VALUE2 DCD &13` | R1=`0x12`, R2=`0x13`, R3=`0x25` |
-| `1d` | `LDR R1,VALUE1` · `LDR R2,VALUE2` · `LDR R3,[R1]` · `LDR R4,[R2]` · `ADD R6,R4,R3`; `VALUE1 DCD &1000`, `VALUE2 DCD &1004` | R1=`0x1000`, R2=`0x1004`, R3=R4=`0` (memory reset value), R6=`0`. With memory preloaded at `0x1000`/`0x1004`, R3/R4/R6 follow. |
+| `1d` | `LDR R1,VALUE1` · `LDR R2,VALUE2` · `LDR R3,[R1]` · `LDR R4,[R2]` · `ADD R6,R4,R3`; `VALUE1 DCD &1000`, `VALUE2 DCD &1004`; **preload** `0x1000 ← 0x00000012`, `0x1004 ← 0x00000013` | R1=`0x1000`, R2=`0x1004`, R3=`0x12`, R4=`0x13`, R6=`0x25` |
+| `1d-zero` | `1d` with no preload | R3=R4=R6=`0` — pins the documented zero-fill behaviour of unwritten memory |
 | `1e` | `MOV R1,#0x12` · `MVN R2,R1` | R2=`0xFFFFFFED` |
 | `2a` | `LDR R1,VALUE` · `MOV R3,R1,LSL #2`; `VALUE DCD &3000F000` | R1=`0x3000F000`, R3=`0xC003C000` |
 | `2b` | `MOVS R3,#0` · `MOVEQ R3,R1,LSL #3` | Exercises §7.3 CPSR round-trip and §6.1 conditional lowering |
@@ -481,9 +516,10 @@ Until answered, the implementation takes the lenient path noted, and records a w
   `AREA PROGRAM, DATA, READONLY` — the same name with different attributes, which [ARMASM]
   treats as an error. Does real `armasm` accept it?
   *Current behaviour:* accepted as two distinct areas, `W004`.
-- **Q5 — Reset memory contents.** Exercise `1d` reads `0x1000`/`0x1004` without writing them.
-  What does the lab's target initialise them to? This determines whether `1d`'s expected values
-  are zeros or something else.
+**Resolved.** *Q5 — reset memory contents.* Exercise `1d` reads `0x1000`/`0x1004` without any
+source construct writing them because in µVision those cells are set by hand in the Memory
+window before running. Memory contents are therefore a user-supplied input, not a target
+default. Modelled as the preload image (§5.3); unwritten memory reads as zero.
 
 ## 12. Alternatives considered
 

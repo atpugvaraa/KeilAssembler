@@ -33,7 +33,10 @@ collaboration features.
 - **G1** — Build and run the given lab exercises without editing their source.
 - **G2** — Show ARM7 register and CPSR state that matches hand-computation, per instruction.
 - **G3** — Make the machine model visible: memory is a browsable, editable address space, not an
-  implementation detail.
+  implementation detail. Writing values into memory before a run is a supported workflow, not a
+  workaround — several lab exercises read from addresses that nothing in their source ever
+  writes, exactly as they do in µVision's Memory window. Editing a cell must not require a
+  rebuild.
 - **G4** — Step forwards and backwards through execution, with the current source line
   highlighted in the editor.
 - **G5** — Report errors against ARM7 semantics using ARMASM terminology, at a source location.
@@ -85,11 +88,11 @@ suite runs via `swift test` with no app target present.
 | M1 | Front end | Lexer + parser + AST; every corpus program parses; round-trip printer |
 | M2 | Analysis | Symbol table, area layout, ARM7 address assignment, diagnostics |
 | M3 | Backend | AArch64 emission for exercises 1(a)–1(e); text output snapshot-tested |
-| M4 | Runtime | `armd_rt.c` — mmap, data-image load, trace writer |
-| M5 | End-to-end CLI | `swift test` builds, links, runs, decodes trace; final state asserted |
+| M4 | Runtime | `armd_rt.c` — mmap, startup-image load, trace writer |
+| M5 | End-to-end CLI | `swift test` builds, links, runs with a preload, decodes trace; final state asserted |
 | M6 | Teaching core | Remaining instructions in Spec §6 with per-instruction tests |
 | M7 | App shell | Editor + Build + Registers panel wired to the package |
-| M8 | Debug UX | Memory browser, trace scrubber, step/step-back, line highlight |
+| M8 | Debug UX | Editable memory browser (preload), trace scrubber, step/step-back, line highlight |
 | M9 | Polish | Generated-assembly view, diagnostics gutter, syntax highlighting |
 
 M1–M6 are the product. M7–M9 are the interface to it. M5 is the point at which the project is
