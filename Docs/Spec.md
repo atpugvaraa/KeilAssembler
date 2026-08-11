@@ -356,11 +356,25 @@ this for confirmation against a real Keil build.
 Every lowered instruction ends with:
 
 ```
-  mov  w0, #<source line index>
-  mov  w1, #<store address, or 0 if none>      ; via movz/movk when wide
-  mov  w2, #<store width in bytes, 0 if none>
+  ; instruction that performs no store
+  movz w0, #<source line index>       ; movk for indices >= 65536
+  mov  w1, wzr
+  mov  w2, wzr
+  bl   _armd_trace
+
+  ; instruction that performs a store — w9 still holds the effective
+  ; ARM7 address computed for the store, and the store does not clobber it
+  movz w0, #<source line index>
+  mov  w1, w9
+  movz w2, #<store width: 1, 2, or 4>
   bl   _armd_trace
 ```
+
+The store address is a **runtime value**, not an immediate: for `STR R0, [R1]` it is
+whatever R1 holds when the instruction executes. It is therefore passed from `w9` — the
+register the memory lowering already computed it into — and the memory lowering must leave
+`w9` live until the trace call. Passing an immediate here would record address 0 for every
+store and leave the memory view permanently empty.
 
 `_armd_trace` appends one fixed-size record:
 
