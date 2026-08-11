@@ -1,4 +1,10 @@
 /// Spec §5.2: labels resolve to ARM7 addresses; EQU symbols are compile-time constants.
+///
+/// `lookup` resolves `constants` before `labels`. A name defined in *both* dictionaries is a
+/// collision — an EQU symbol reusing a label name, or vice versa — that `lookup` cannot signal:
+/// it can only silently pick constants and shadow the label. `lookup` does not diagnose this,
+/// so whatever populates this table (Task 10's layout/symbol-collection pass) must check for a
+/// name existing in both dictionaries and emit a diagnostic before it ever reaches `lookup`.
 struct SymbolTable: Sendable {
     var constants: [String: UInt32] = [:]
     var labels: [String: UInt32] = [:]

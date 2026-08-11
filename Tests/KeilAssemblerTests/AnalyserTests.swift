@@ -104,6 +104,23 @@ private func evaluate(_ expression: Expression, symbols: SymbolTable = SymbolTab
     #expect(evaluate(.unary(.plus, .integer(0x42))) == 0x42)
 }
 
+@Test func evaluatorComputesUnaryMinus() {
+    // The only prior `.unary(.minus, ...)` use had a nil operand, so the
+    // `0 &- value` branch itself never ran. A regression turning it into
+    // plain `value` (dropping negation) or a trapping `0 - value` (crashing
+    // instead of wrapping) would both pass the rest of the suite silently.
+    #expect(evaluate(.unary(.minus, .integer(0))) == 0)
+    #expect(evaluate(.unary(.minus, .integer(1))) == 0xFFFF_FFFF)
+}
+
+@Test func evaluatorWrapsMultiplyAndAddOnOverflow() {
+    // Every prior arithmetic test stayed well under UInt32.max, so replacing
+    // `&*`/`&+` with the trapping `*`/`+` would still pass. These force an
+    // actual overflow through both operators.
+    #expect(evaluate(.binary(.multiply, .integer(0x8000_0000), .integer(2))) == 0)
+    #expect(evaluate(.binary(.add, .integer(0xFFFF_FFFF), .integer(2))) == 1)
+}
+
 @Test func evaluatorResolvesHereToTheSuppliedAddress() {
     // Every other test passes `here: 0`, so a wrong implementation that
     // always returned 0 for `.here` (ignoring the parameter) would pass
