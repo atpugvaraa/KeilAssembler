@@ -261,6 +261,21 @@ struct Parser {
             values.append(expression)
         } while match(.comma)
 
+        // The loop above only re-enters on a comma. If it stopped for any other reason
+        // while there is still more on the line, a value was silently dropped (e.g.
+        // `DCD 1 2` parses `1`, sees `2` isn't a comma, and would otherwise exit clean).
+        // Diagnose it and consume the rest of the line so the orphan isn't re-dispatched
+        // as a bogus top-level statement.
+        if peek() != .endOfLine, peek() != .endOfFile {
+            diagnostics.emit(Diagnostic(
+                severity: .error, code: "E039",
+                message: "expected ',' between data-list values",
+                range: current.range,
+                note: "separate values with ','"
+            ))
+            skipToEndOfLine()
+        }
+
         if values.isEmpty {
             diagnostics.emit(Diagnostic(
                 severity: .error, code: "E009",

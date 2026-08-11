@@ -156,6 +156,48 @@ func parse(_ source: String) -> (Program, DiagnosticBag) {
     )))
 }
 
+@Test func parserGroupsShiftTighterThanLogical() {
+    // :AND:/:OR:/:EOR: are the loosest tier, binding looser than :SHL:/:SHR:. A chain that
+    // swapped parseLogical and parseShift would build .binary(.shiftLeft, .binary(.and, 1, 2), 3)
+    // instead — still a valid-looking tree, only catchable by pinning the shape.
+    let (program, bag) = parse("N EQU 1 :AND: 2 :SHL: 3\n")
+    #expect(bag.diagnostics.isEmpty)
+    #expect(program.lines[0].statement == .directive(.equ(
+        symbol: "N",
+        value: .binary(.and, .integer(1), .binary(.shiftLeft, .integer(2), .integer(3)))
+    )))
+}
+
+@Test func parserMapsEachLogicalOperatorWordToItsOwnDistinctOperator() {
+    // Catches a typo in the `logicalOperators` dictionary (e.g. "EOR" mapped to .or) that a
+    // "does it parse" test would never see, since the result is still a valid Expression tree.
+    func value(_ source: String) -> Expression? {
+        guard case .directive(.equ(_, let value))? = parse(source).0.lines[0].statement else { return nil }
+        return value
+    }
+    #expect(value("N EQU 1 :AND: 2\n") == .binary(.and, .integer(1), .integer(2)))
+    #expect(value("N EQU 1 :OR: 2\n") == .binary(.or, .integer(1), .integer(2)))
+    #expect(value("N EQU 1 :EOR: 2\n") == .binary(.exclusiveOr, .integer(1), .integer(2)))
+}
+
+@Test func parserParsesModAsABinaryOperator() {
+    let (program, bag) = parse("N EQU 7 :MOD: 2\n")
+    #expect(bag.diagnostics.isEmpty)
+    #expect(program.lines[0].statement == .directive(.equ(
+        symbol: "N", value: .binary(.modulo, .integer(7), .integer(2))
+    )))
+}
+
+@Test func parserGroupsModAtTheSameTierAsMultiplication() {
+    // :MOD: sits with * and /, tighter than + -, so this must group as 1 + (6 :MOD: 4).
+    let (program, bag) = parse("N EQU 1 + 6 :MOD: 4\n")
+    #expect(bag.diagnostics.isEmpty)
+    #expect(program.lines[0].statement == .directive(.equ(
+        symbol: "N",
+        value: .binary(.add, .integer(1), .binary(.modulo, .integer(6), .integer(4)))
+    )))
+}
+
 @Test func parserParsesCaretAsBitwiseNotNotExclusiveOr() {
     // Domain rule: '^' is unary NOT in this dialect (no '~' token in the lexer), not XOR.
     // A wrong implementation that drops '^' silently would produce .integer(1) instead.
@@ -223,5 +265,30 @@ func parse(_ source: String) -> (Program, DiagnosticBag) {
     let (program, bag) = parse("VALS DCD 1, ), 3\n")
     #expect(bag.diagnostics.map(\.code) == ["E016"])
     #expect(program.lines[0].statement == .directive(.defineWords([.integer(1)])))
+    #expect(program.lines.count == 1)
+}
+
+// MARK: - Review fix: a missing comma between data-list values must be diagnosed
+
+@Test func parserDiagnosesADataListMissingACommaBetweenValues() {
+    // Without a fix, `1` parses, `while match(.comma)` is false (next token is `.integer(2)`,
+    // not a comma), the loop exits silently with values == [1], and the orphaned `2` gets
+    // re-dispatched as a bogus top-level statement (misleading E006), with NO diagnostic
+    // naming the actual problem: half the data silently vanished.
+    let (program, bag) = parse("VALUE1 DCD 1 2\n")
+    #expect(bag.diagnostics.map(\.code) == ["E039"])
+    #expect(program.lines[0].statement == .directive(.defineWords([.integer(1)])))
+    // The orphaned `2` must not surface as a second, misleadingly-diagnosed line.
+    #expect(program.lines.count == 1)
+}
+
+@Test func parserDiagnosesADcbStringListMissingACommaBetweenValues() {
+    // Same defect via string literals: `DCB "ab" "cd"` would otherwise silently emit only
+    // 2 bytes ("ab") instead of 4, with no diagnostic pointing at the dropped "cd".
+    let (program, bag) = parse("    DCB \"ab\" \"cd\"\n")
+    #expect(bag.diagnostics.map(\.code) == ["E039"])
+    #expect(program.lines[0].statement == .directive(.defineBytes([
+        .integer(UInt32(UnicodeScalar("a").value)), .integer(UInt32(UnicodeScalar("b").value)),
+    ])))
     #expect(program.lines.count == 1)
 }
