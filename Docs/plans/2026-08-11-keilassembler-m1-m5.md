@@ -2300,7 +2300,10 @@ enum Analyser {
         let result = PerfLog.measure("analyse") { () -> AnalysedProgram in
             var symbols = SymbolTable()
             var addresses: [Int: UInt32] = [:]
-            var dataSizes: [Int: Int] = [:]
+            /// Index into `program.lines` → the ARM7 address of that line's data.
+            /// Recorded here in pass 1 so pass 2 never has to re-derive the layout,
+            /// and so unlabelled data directives are addressable too.
+            var dataAddresses: [Int: UInt32] = [:]
             var entryLineIndex: Int?
             var seenAreaNames: Set<String> = []
             var position = origin
@@ -2342,28 +2345,28 @@ enum Analyser {
 
                     case .defineBytes(let values):
                         if let label = line.label { symbols.labels[label] = position }
-                        dataSizes[index] = values.count
+                        dataAddresses[index] = position
                         position &+= UInt32(values.count)
                         continue
 
                     case .defineHalfwords(let values):
                         position = align(position, to: 2)
                         if let label = line.label { symbols.labels[label] = position }
-                        dataSizes[index] = values.count * 2
+                        dataAddresses[index] = position
                         position &+= UInt32(values.count * 2)
                         continue
 
                     case .defineWords(let values):
                         position = align(position, to: 4)
                         if let label = line.label { symbols.labels[label] = position }
-                        dataSizes[index] = values.count * 4
+                        dataAddresses[index] = position
                         position &+= UInt32(values.count * 4)
                         continue
 
                     case .space(let size):
                         if let label = line.label { symbols.labels[label] = position }
+                        dataAddresses[index] = position
                         if let count = ExpressionEvaluator.evaluate(size, symbols: symbols, here: position, range: line.range, diagnostics: &bag) {
-                            dataSizes[index] = Int(count)
                             position &+= count
                         }
                         continue
@@ -2413,7 +2416,7 @@ enum Analyser {
             var dataImage: [ImageBlob] = []
             for (index, line) in program.lines.enumerated() {
                 guard case .directive(let directive)? = line.statement,
-                      let address = line.label.flatMap({ symbols.labels[$0] }) ?? addressOfData(index, dataSizes: dataSizes, symbols: symbols, line: line)
+                      let address = dataAddresses[index]
                 else { continue }
 
                 switch directive {
@@ -2466,40 +2469,19 @@ enum Analyser {
         let remainder = value % boundary
         return remainder == 0 ? value : value &+ (boundary - remainder)
     }
-
-    /// Unlabelled data directives still occupy space; they are addressed by
-    /// walking the layout, which pass 1 already recorded in `dataSizes`.
-    private static func addressOfData(
-        _ index: Int, dataSizes: [Int: Int], symbols: SymbolTable, line: Line
-    ) -> UInt32? {
-        dataSizes[index] == nil ? nil : nil
-    }
 }
 ```
 
-Unlabelled data directives are the one gap: `addressOfData` returns nil, so only labelled `DCB`/`DCW`/`DCD`/`SPACE` reach the data image. Every corpus program in Spec §10 labels its data. Task 11's step 4 closes this by recording each data directive's address in pass 1.
+Because pass 1 records `dataAddresses[index]` for every data directive — labelled or
+not — pass 2 never re-derives the layout, and unlabelled `DCB`/`DCW`/`DCD`/`SPACE`
+reach the data image too.
 
-- [ ] **Step 4: Record data addresses in pass 1 instead of re-deriving them**
-
-Replace the `addressOfData` helper and the `dataSizes` dictionary with a direct address map. In pass 1, each `defineBytes`/`defineHalfwords`/`defineWords`/`space` case records `dataAddresses[index] = position` immediately before advancing `position`, and pass 2 reads `dataAddresses[index]`:
-
-```swift
-            var dataAddresses: [Int: UInt32] = [:]
-            // ... in each data case, before `position &+=`:
-            dataAddresses[index] = position
-            // ... pass 2 header becomes:
-            guard case .directive(let directive)? = line.statement,
-                  let address = dataAddresses[index] else { continue }
-```
-
-Delete `dataSizes` and `addressOfData` entirely.
-
-- [ ] **Step 5: Run the test to verify it passes**
+- [ ] **Step 4: Run the test to verify it passes**
 
 Run: `swift test --filter AnalyserTests`
 Expected: PASS, 8 tests.
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 5: Commit**
 
 ```bash
 cd ~/Programming/Swift/Packages/KeilAssembler
@@ -3545,6 +3527,14 @@ Append to `Tests/KeilAssemblerTests/LoweringTests.swift`:
     #expect(text.contains("movz    w2, #4"))
 }
 
+@Test func postIndexedAccessHappensExactlyOnceThenWritesBack() {
+    let text = lower(preamble + "\n    LDR R3, [R1], #4\n").0 ?? ""
+    // One access, not two: the address mode computes, the shared block accesses.
+    #expect(text.components(separatedBy: "[x28, w9, uxtw]").count - 1 == 1)
+    #expect(text.contains("add     w12, w9, w12"))
+    #expect(text.contains("str     w12, [x27, #4]"))     // R1 written back
+}
+
 @Test func pushAndPopMoveTheARM7StackPointer() {
     let text = lower(preamble + "\n    PUSH {R1, R4}\n").0 ?? ""
     #expect(text.contains("ldr     w9, [x27, #52]"))   // R13
@@ -3586,6 +3576,9 @@ Replace the `default:` arm of the `switch instruction.mnemonic` with these cases
 
             let width = accessWidth(instruction.mnemonic)
             let isStore = [Mnemonic.str, .strb, .strh].contains(instruction.mnemonic)
+            /// Set only by post-indexed addressing; the base register whose updated
+            /// value sits in w12 and must be written back after the access.
+            var postIndexBase: Int?
 
             // Effective ARM7 address into w9.
             switch mode {
@@ -3628,21 +3621,23 @@ Replace the `default:` arm of the `switch instruction.mnemonic` with these cases
                 let value = ExpressionEvaluator.evaluate(
                     offset, symbols: symbols, here: address, range: range, diagnostics: &diagnostics
                 ) ?? 0
-                // The access uses the original base; the write-back happens after.
+                // The access uses the original base, still in w9. w12 carries the
+                // updated base and is written back only after the shared access
+                // below — post-indexing must not emit an access of its own.
                 Emitter.materialiseImmediate(value, into: "w12", into: &builder)
-                builder.instruction("\(pad(isStore ? "str" : "ldr"))\(widthSuffix(width)) \(isStore ? "w11" : "w11"), [x28, w9, uxtw]")
-                if isStore { Emitter.loadRegister(dataRegister, into: "w11", into: &builder) }
                 builder.instruction("\(pad(negated ? "sub" : "add")) w12, w9, w12")
-                Emitter.storeRegister(base, from: "w12", into: &builder)
+                postIndexBase = base
             }
 
             if isStore {
                 Emitter.loadRegister(dataRegister, into: "w11", into: &builder)
                 builder.instruction("\(pad("str" + widthSuffix(width))) w11, [x28, w9, uxtw]")
+                if let postIndexBase { Emitter.storeRegister(postIndexBase, from: "w12", into: &builder) }
                 Emitter.trace(line: sourceLine, storeAddressRegister: "w9", storeWidth: width, into: &builder)
             } else {
                 builder.instruction("\(pad("ldr" + widthSuffix(width))) w11, [x28, w9, uxtw]")
                 Emitter.storeRegister(dataRegister, from: "w11", into: &builder)
+                if let postIndexBase { Emitter.storeRegister(postIndexBase, from: "w12", into: &builder) }
                 Emitter.trace(line: sourceLine, storeAddressRegister: nil, storeWidth: 0, into: &builder)
             }
             return
@@ -4463,7 +4458,7 @@ git commit -m "test: full Spec §10 corpus running end to end with memory preloa
 - **§7.4 `RRX`** is diagnosed (`E036`), not lowered — Spec §7.4 never defines the sequence. Task 14 step 3 documents this.
 - **General `LDM`/`STM` → `E012`** is not implemented; those mnemonics simply do not parse and yield `E013`. Same shape of gap as `NV`.
 
-**2. Placeholder scan.** No "TBD", no "add error handling", no "similar to Task N". The two intentional stubs (Task 5 step 4, Task 7 step 4) exist so the file compiles between tasks and are each replaced by a named later task. Task 10 step 3 ships a knowingly incomplete `addressOfData` that step 4 deletes in the same task — flagged in prose at both points.
+**2. Placeholder scan.** No "TBD", no "add error handling", no "similar to Task N". The two intentional stubs (Task 5 step 4, Task 7 step 4) exist so the file compiles between tasks and are each replaced by a named later task; each dispatch says so explicitly, so a reviewer is not left to guess whether they are abandoned code.
 
 **3. Type consistency.** `SourceRange(line:column:length:)`, `Diagnostic(severity:code:message:range:note:)`, `DiagnosticBag.emit`, `Token.Kind`, `Mnemonic.decompose`, `Operand2.shifted(register:shift:)`, `ShiftSpec(kind:amount:amountRegister:)`, `AddressMode` cases, `ImageBlob(address:bytes:)`, `AnalysedProgram.addresses`, `Emitter.loadRegister(_:into:into:)`, `MachineSnapshot.registers`, `MemoryPreload(words:)` are each defined once and used with the same spelling everywhere after. `Emitter`'s methods take `into builder:` as the trailing label throughout, including `loadRegister(1, into: "w9", into: &builder)` — awkward to read, consistent to call.
 
