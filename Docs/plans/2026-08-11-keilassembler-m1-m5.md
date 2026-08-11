@@ -1476,6 +1476,18 @@ Expected: FAIL — `parseDirective` returns nil, so `statement` is nil.
                 range: range, note: nil
             ))
         }
+
+        // A list that stops before the end of the line means a comma is missing.
+        // Without this, `DCD 1 2` silently emits only the 1, and the orphaned 2
+        // resurfaces as a bogus top-level statement with a misleading E006 (PRD S3).
+        if peek() != .endOfLine, peek() != .endOfFile {
+            diagnostics.emit(Diagnostic(
+                severity: .error, code: "E039",
+                message: "expected ',' between data-list values",
+                range: current.range, note: nil
+            ))
+            skipToEndOfLine()
+        }
         return values
     }
 ```

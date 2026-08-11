@@ -466,6 +466,64 @@ Errors are collected, not thrown: one build reports every error it can find. A b
 error emits no assembly. Reserved ranges: `E0xx` syntax, `E1xx` unsupported construct, `E2xx`
 semantics, `W0xx` compatibility warnings.
 
+### 8.1 Allocated codes
+
+Every code lives here, including codes reserved for stages not yet written. An implementer can
+only see code that already ships, so without this list they cannot avoid colliding with a code a
+later stage has claimed — which has already happened once. **Allocate from this table, and add
+the row in the same commit as the code.**
+
+| Code | Meaning | Stage |
+|---|---|---|
+| `E001` | unexpected character | Lexer |
+| `E002` | unterminated string literal | Lexer |
+| `E003` | unterminated character literal | Lexer |
+| `E004` | unterminated `:OPERATOR:` | Lexer |
+| `E005` | invalid numeric literal, or invalid base | Lexer |
+| `E006` | expected an instruction or directive | Parser |
+| `E007` | `EXPORT` expects a symbol name | Parser |
+| `E008` | `AREA` expects a section name | Parser |
+| `E009` | data directive needs at least one value | Parser |
+| `E010` | directive not supported in this subset | Parser |
+| `E011` | `NV` condition is deprecated and rejected | Parser |
+| `E012` | general `LDM`/`STM` not in this subset | Parser |
+| `E013` | instruction not supported in this subset | Parser |
+| `E014` | computed branch not supported | Analyser |
+| `E015` | expected `)` | Parser |
+| `E016` | expected a value | Parser |
+| `E017` | `EQU` requires a preceding label | Parser |
+| `E018` | expected a register or an immediate | Parser |
+| `E019` | shift needs a shift amount | Parser |
+| `E020` | immediate cannot be encoded | Analyser |
+| `E021` | R15 cannot be used as a data operand | Analyser |
+| `E022` | expected a base register after `[` | Parser |
+| `E023` | expected a post-indexed offset | Parser |
+| `E024` | expected `,` or `]` | Parser |
+| `E025` | expected `]` | Parser |
+| `E026` | expected an offset register or `#` | Parser |
+| `E027` | expected a shift after the offset register | Parser |
+| `E028` | scaled register offset needs an immediate shift | Parser |
+| `E029` | expected a register in the list | Parser |
+| `E030` | expected `}` | Parser |
+| `E031` | symbol is not defined | Analyser |
+| `E032` | division by zero | Analyser |
+| `E033` | no `ENTRY` directive | Analyser |
+| `E034` | more than one `ENTRY` directive | Analyser |
+| `E035` | instruction appears in a `DATA` area | Analyser |
+| `E036` | `RRX` is not lowered in this milestone | Backend |
+| `E037` | operand is not valid here | Backend |
+| `E038` | expected an operand | Parser |
+| `E039` | expected `,` between data-list values | Parser |
+| `W001` | statement in the label column | Parser |
+| `W002` | stray `,` after a data directive | Parser |
+| `W003` | `AREA` attribute ignored | Parser |
+| `W004` | `AREA` name declared more than once | Analyser |
+| `W010` | barrel-shifter carry not modelled (§9 D1) | Analyser |
+| `W011` | unaligned access not modelled (§9 D4) | Analyser |
+| `W012` | shift amount ≥ 32 (§9 D8) | Analyser |
+
+Next free error code: `E040`. Next free warning code: `W005` (or `W013` in the deviation band).
+
 ## 9. Deviations from real ARM7
 
 Each is a deliberate, documented limit. Where a program's behaviour would differ, the analyser
