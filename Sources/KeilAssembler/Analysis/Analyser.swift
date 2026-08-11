@@ -88,6 +88,28 @@ enum Analyser {
                 symbols.constants[name] = value
             }
 
+            // Pass 0 — EQU pre-pass. SPACE's size and ALIGN's amount must be known
+            // during pass 1 to keep laying out what follows, but `symbols.constants`
+            // is otherwise only populated in pass 1b, after pass 1 finishes — so a
+            // completely ordinary backward reference like `SIZE EQU 4` / `BUF SPACE
+            // SIZE` would misreport SIZE as undefined. Give constants a chance to
+            // resolve first: evaluate every EQU into a scratch bag that is discarded,
+            // not the real one, because an EQU that references a label (which cannot
+            // resolve yet — no layout has happened) is not an error at this point, it
+            // is simply not resolvable *yet*. Pass 1b re-evaluates every EQU again
+            // against the real bag once every label is bound, so anything depending
+            // on a label still gets its correct value and, if genuinely undefined,
+            // its real diagnostic there. This is a third linear pass, not a fixpoint:
+            // it runs once, over EQUs only, and never re-visits anything.
+            var scratch = DiagnosticBag()
+            for line in program.lines {
+                if case .directive(.equ(let symbol, let value))? = line.statement {
+                    if let resolved = ExpressionEvaluator.evaluate(value, symbols: symbols, here: 0, range: line.range, diagnostics: &scratch) {
+                        symbols.constants[symbol] = resolved
+                    }
+                }
+            }
+
             // Pass 1 — layout. Sizes are known without evaluating any expression:
             // an instruction is 4 bytes and a data directive's size is its element
             // count, so forward references resolve in pass 2 without a fixpoint.
@@ -190,6 +212,12 @@ enum Analyser {
                     note: "mark the entry point with ENTRY"
                 ))
             }
+
+            // Discard pass 0's provisional constants before pass 1b runs its own,
+            // authoritative binding. Without this, every constant pass 0 already
+            // resolved would appear to `bindConstant` as pre-existing, and pass 1b
+            // would misreport every ordinary EQU as a duplicate of itself.
+            symbols.constants = [:]
 
             // Pass 1b — EQU constants, now that every label is bound.
             for line in program.lines {

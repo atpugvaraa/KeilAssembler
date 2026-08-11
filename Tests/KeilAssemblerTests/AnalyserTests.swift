@@ -354,6 +354,137 @@ private func analyse(_ source: String) -> (AnalysedProgram, DiagnosticBag) {
     #expect(wval == bval + 4)       // Rounded up to the next 4-byte boundary.
 }
 
+// MARK: - Review fix round: EQU pre-pass so SPACE/ALIGN can see constants
+
+@Test func analyserResolvesASpaceSizeDefinedByAnEarlierEqu() {
+    // Regression for review finding 1: `symbols.constants` is populated only in
+    // pass 1b, which runs after the whole pass-1 layout loop finishes — so a SPACE
+    // whose size names an EQU'd constant fails with a misleading "not defined" even
+    // when the EQU is a *backward* reference (defined lexically above the SPACE).
+    // `SIZE EQU 4` / `BUF SPACE SIZE` is ordinary ARMASM idiom, so this must resolve,
+    // and AFTER's address must reflect a real 4-byte advance, not a swallowed size.
+    let (analysed, bag) = analyse("""
+        AREA PROGRAM, CODE, READONLY
+        ENTRY
+    MAIN
+        MOV R1, #1
+        AREA STORAGE, DATA, READONLY
+    SIZE EQU 4
+    BUF SPACE SIZE
+    AFTER DCB &FF
+    """)
+    #expect(bag.hasErrors == false)
+    #expect(bag.diagnostics.map(\.code).contains("E031") == false)
+    let buf = analysed.symbols.labels["BUF"]!
+    let after = analysed.symbols.labels["AFTER"]!
+    #expect(after == buf + 4)
+}
+
+@Test func analyserAlignAmountDefinedByAnEarlierEquResolves() {
+    // Same gap, ALIGN's side: the amount expression is evaluated in pass 1, before
+    // pass 1b binds constants, so a backward-referencing EQU used as an ALIGN amount
+    // hit the identical bug. Symmetric coverage to the SPACE case above.
+    let (analysed, bag) = analyse("""
+        AREA PROGRAM, CODE, READONLY
+        ENTRY
+    MAIN
+        MOV R1, #1
+        AREA STORAGE, DATA, READONLY
+    EIGHT EQU 8
+    BVAL DCB &FF
+        ALIGN EIGHT
+    AFTER DCB &FF
+    """)
+    #expect(bag.hasErrors == false)
+    #expect(bag.diagnostics.map(\.code).contains("E031") == false)
+    let after = analysed.symbols.labels["AFTER"]!
+    #expect(after % 8 == 0)
+}
+
+@Test func analyserStillDiagnosesAGenuinelyUndefinedSpaceSize() {
+    // The EQU pre-pass evaluates into a scratch, discarded DiagnosticBag specifically
+    // so a forward reference to a *label* (which legitimately cannot resolve before
+    // layout) produces no spurious pre-pass diagnostic. That must not become a hole
+    // that swallows real errors: a SPACE size naming a symbol that is never defined
+    // anywhere still has to reach the real bag with E031 from pass 1's own evaluation.
+    let (_, bag) = analyse("""
+        AREA PROGRAM, CODE, READONLY
+        ENTRY
+    MAIN
+        MOV R1, #1
+        AREA STORAGE, DATA, READONLY
+    BUF SPACE NOPE
+    """)
+    #expect(bag.diagnostics.map(\.code).contains("E031"))
+}
+
+@Test func analyserEquReferencingALabelStillResolvesInPass1b() {
+    // Guards the other direction: the pre-pass must not let a label-referencing EQU
+    // bind early to a bogus value (labels don't exist yet when the pre-pass runs, so
+    // its scratch-bag evaluation of this EQU necessarily fails and is discarded).
+    // Pass 1b, which runs after every label is bound, must still resolve it correctly
+    // — OFFSET must equal VALUE1's real address, not be missing or wrong.
+    let (analysed, bag) = analyse("""
+        AREA PROGRAM, CODE, READONLY
+        ENTRY
+    MAIN
+        MOV R1, #1
+        AREA STORAGE, DATA, READONLY
+    VALUE1 DCD &00000012
+    OFFSET EQU VALUE1
+    """)
+    #expect(bag.hasErrors == false)
+    #expect(analysed.symbols.constants["OFFSET"] == analysed.symbols.labels["VALUE1"])
+}
+
+// MARK: - Review fix round: DCW and SPACE had zero coverage
+
+@Test func analyserAlignsDCWToTwoAndAdvancesByTwoPerHalfword() {
+    // DCW had no test anywhere in the repo. Pins both address-arithmetic rules at
+    // once: a 1-byte DCB leaves the cursor odd, so the following DCW must round up
+    // to the next *even* address (not sit one byte later, and not over-round to a
+    // 4-byte boundary the way DCD does) — and two halfwords must advance the cursor
+    // by exactly 4, asserted on a label placed right after. Also pins little-endian
+    // byte order for DCW specifically, not just DCD.
+    let (analysed, bag) = analyse("""
+        AREA PROGRAM, CODE, READONLY
+        ENTRY
+    MAIN
+        MOV R1, #1
+        AREA STORAGE, DATA, READONLY
+    BVAL DCB &FF
+    HVAL DCW &1234, &5678
+    AFTER DCB &FF
+    """)
+    #expect(bag.hasErrors == false)
+    let bval = analysed.symbols.labels["BVAL"]!
+    let hval = analysed.symbols.labels["HVAL"]!
+    let after = analysed.symbols.labels["AFTER"]!
+    #expect(hval == bval + 2)   // Rounds up to the next even address, not bval + 1.
+    #expect(after == hval + 4) // Two halfwords, 2 bytes each.
+    let blob = analysed.dataImage.first { $0.address == hval }
+    #expect(blob?.bytes == [0x34, 0x12, 0x78, 0x56])
+}
+
+@Test func analyserAdvancesExactlyNByteCountForSpace() {
+    // SPACE had no test anywhere in the repo either. A SPACE 10 between two labels
+    // must advance the cursor by exactly 10 — catches an off-by-one (e.g. reserving
+    // n+1 or n-1 bytes) that a `hasErrors == false`-only assertion would never see.
+    let (analysed, bag) = analyse("""
+        AREA PROGRAM, CODE, READONLY
+        ENTRY
+    MAIN
+        MOV R1, #1
+        AREA STORAGE, DATA, READONLY
+    BEFORE SPACE 10
+    AFTER DCB &FF
+    """)
+    #expect(bag.hasErrors == false)
+    let before = analysed.symbols.labels["BEFORE"]!
+    let after = analysed.symbols.labels["AFTER"]!
+    #expect(after == before + 10)
+}
+
 @Test func analyserAlignZeroFromSourceDoesNotHangOrCrash() {
     // Termination guard: `align(_:to:)` must not divide by zero or spin when the
     // boundary is 0 or 1 — including when `ALIGN 0` reaches it straight from
