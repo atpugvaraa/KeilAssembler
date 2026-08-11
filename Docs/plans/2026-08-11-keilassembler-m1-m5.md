@@ -1984,8 +1984,11 @@ Expected: FAIL — the stubs return nil, so `operands` stops after the destinati
             guard match(.comma) else {
                 return .immediateOffset(base: base, offset: nil, negated: false, writeBack: false)
             }
-            let negated = parseOffsetSign()
-            guard match(.hash), let offset = parseExpression(into: &diagnostics) else {
+            // The sign follows the hash: ARM writes `[Rn], #-4`, and the lexer emits
+            // `#`, `-`, `8` as three separate tokens. Reading the sign first would
+            // always see the hash, leave `negated` false, and let parseExpression's
+            // own unary-minus swallow the sign into the expression instead.
+            guard match(.hash) else {
                 diagnostics.emit(Diagnostic(
                     severity: .error, code: "E023",
                     message: "expected a post-indexed offset",
@@ -1993,6 +1996,8 @@ Expected: FAIL — the stubs return nil, so `operands` stops after the destinati
                 ))
                 return nil
             }
+            let negated = parseOffsetSign()
+            guard let offset = parseExpression(into: &diagnostics) else { return nil }
             return .postIndexed(base: base, offset: offset, negated: negated)
         }
 
@@ -2005,10 +2010,11 @@ Expected: FAIL — the stubs return nil, so `operands` stops after the destinati
             return nil
         }
 
-        let negated = parseOffsetSign()
-
-        // `[Rn, #±off]{!}`
+        // `[Rn, #±off]{!}` — the sign follows the hash, so the hash is matched first.
+        // For the register-offset form below the sign genuinely comes first (`[Rn, -R3]`),
+        // which is why `parseOffsetSign` is called twice rather than hoisted.
         if match(.hash) {
+            let negated = parseOffsetSign()
             guard let offset = parseExpression(into: &diagnostics) else { return nil }
             guard match(.rightBracket) else {
                 diagnostics.emit(Diagnostic(
@@ -2022,7 +2028,8 @@ Expected: FAIL — the stubs return nil, so `operands` stops after the destinati
             return .immediateOffset(base: base, offset: offset, negated: negated, writeBack: writeBack)
         }
 
-        // `[Rn, ±Rm{, <shift> #k}]{!}`
+        // `[Rn, ±Rm{, <shift> #k}]{!}` — here the sign really does precede the register.
+        let negated = parseOffsetSign()
         guard case .register(let offsetRegister) = peek() else {
             diagnostics.emit(Diagnostic(
                 severity: .error, code: "E026",
