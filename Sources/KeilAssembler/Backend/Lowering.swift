@@ -86,11 +86,27 @@ extension Lowering {
                 return name
             })
 
+            // Spec §7.5: a return sequence (`BX LR` / `MOV PC, LR` / `POP {..., PC}`)
+            // only has a frame to pop once execution has passed a call-target label —
+            // the `stp` those labels open above. Outside one (MAIN's own top-level
+            // `BX LR`, the natural way to end a program with no subroutines), there
+            // is nothing to pop: doing so anyway pops the host prologue's own saved
+            // x27/x28 and x29/x30 pairs and returns through garbage. This program's
+            // structure is flat — call targets are written after the code that calls
+            // them and never interleaved back into top-level flow — so a simple
+            // latch that goes true on the first call-target label and never resets
+            // is exactly right for every program this subset can express; it is not
+            // reset on a return because a callee may contain more than one (e.g. a
+            // conditional early return followed by a later unconditional one), and
+            // both need the same "inside a call target" treatment.
+            var insideCallTargetFrame = false
+
             for (index, line) in analysed.program.lines.enumerated() {
                 if let label = line.label, analysed.symbols.labels[label] != nil {
                     builder.label(Emitter.armLabel(label))
                     if callTargets.contains(label) {
                         builder.instruction("stp     x29, x30, [sp, #-16]!")
+                        insideCallTargetFrame = true
                     }
                 }
 
@@ -115,7 +131,8 @@ extension Lowering {
 
                 emit(
                     instruction, address: address, sourceLine: instruction.range.line,
-                    symbols: analysed.symbols, into: &builder, diagnostics: &bag
+                    symbols: analysed.symbols, insideCallTarget: insideCallTargetFrame,
+                    into: &builder, diagnostics: &bag
                 )
 
                 if let skipLabel { builder.label(skipLabel) }
@@ -132,16 +149,31 @@ extension Lowering {
         return text
     }
 
-    /// Spec §7.5.
+    /// Spec §7.5. `insideCallTarget` is Spec §7.5's frame invariant, threaded down
+    /// from `lower`'s per-line latch (see its declaration): true once emission has
+    /// passed a `BL` target's label, so a return sequence here has an open frame
+    /// to pop. Outside one, a return branches to the shared exit label instead.
     static func emit(
         _ instruction: Instruction,
         address: UInt32,
         sourceLine: Int,
         symbols: SymbolTable,
+        insideCallTarget: Bool,
         into builder: inout AssemblyBuilder,
         diagnostics: inout DiagnosticBag
     ) {
         let range = instruction.range
+
+        // Spec §3, §7.7, §9 D2: R15 holds "the synthetic ARM7 address of the
+        // current instruction, for display" — nothing wrote it before this fix, so
+        // it (and every trace record's `pc` field, which reads it straight from
+        // the register file) was always 0. Materialised into w11, a scratch
+        // register every case below either never reads or immediately overwrites
+        // before its own use, so this can't disturb any later w11 read, w9/w10/w12
+        // liveness for stores, or the flags round-trip (which uses w9 only, via
+        // `saveFlags`/`restoreFlags`, never w11).
+        Emitter.materialiseImmediate(address, into: "w11", into: &builder)
+        Emitter.storeRegister(15, from: "w11", into: &builder)
 
         switch instruction.mnemonic {
         case .nop:
@@ -161,8 +193,7 @@ extension Lowering {
             if instruction.mnemonic == .mov, !instruction.setsFlags,
                destination == 15, source == .operand2(.register(14)) {
                 Emitter.trace(line: sourceLine, storeAddressRegister: nil, storeWidth: 0, into: &builder)
-                builder.instruction("ldp     x29, x30, [sp], #16")
-                builder.instruction("ret")
+                emitReturn(insideCallTarget: insideCallTarget, into: &builder)
                 return
             }
             materialise(source, symbols: symbols, address: address, range: range, into: &builder, diagnostics: &diagnostics)
@@ -371,6 +402,14 @@ extension Lowering {
                 }
                 Emitter.trace(line: sourceLine, storeAddressRegister: "w9", storeWidth: 4, into: &builder)
             } else {
+                // Critical 1: `POP {..., PC}` is the canonical ARM subroutine
+                // return, the natural partner to `PUSH {..., LR}` — the list is
+                // sorted ascending (Spec §6.3 / `Parser.parseRegisterList`), so R15,
+                // the highest possible register number, is always last when present.
+                // `Analyser.check`'s `.registerList` case deliberately does not
+                // diagnose it (unlike PUSH/STMFD of R15): it is a genuine write to
+                // R15, lowered here as the real function return, not a data read.
+                let returnsThroughLR = registers.last == 15
                 for (slot, register) in registers.enumerated() {
                     if slot == 0 {
                         builder.instruction("ldr     w11, [x28, w9, uxtw]")
@@ -378,11 +417,20 @@ extension Lowering {
                         builder.instruction("add     w12, w9, #\(slot * 4)")
                         builder.instruction("ldr     w11, [x28, w12, uxtw]")
                     }
-                    Emitter.storeRegister(register, from: "w11", into: &builder)
+                    // R15's slot is never written from the popped word: it would
+                    // show a stale return address instead of "this instruction's
+                    // own address" (Important 4's per-instruction PC write, at the
+                    // top of every `emit` call, already owns that slot).
+                    if register != 15 {
+                        Emitter.storeRegister(register, from: "w11", into: &builder)
+                    }
                 }
                 builder.instruction("add     w9, w9, #\(registers.count * 4)")
                 Emitter.storeRegister(13, from: "w9", into: &builder)
                 Emitter.trace(line: sourceLine, storeAddressRegister: nil, storeWidth: 0, into: &builder)
+                if returnsThroughLR {
+                    emitReturn(insideCallTarget: insideCallTarget, into: &builder)
+                }
             }
             return
 
@@ -421,12 +469,27 @@ extension Lowering {
                 unsupported(instruction, into: &diagnostics); return
             }
             Emitter.trace(line: sourceLine, storeAddressRegister: nil, storeWidth: 0, into: &builder)
-            builder.instruction("ldp     x29, x30, [sp], #16")
-            builder.instruction("ret")
+            emitReturn(insideCallTarget: insideCallTarget, into: &builder)
             return
         }
 
         Emitter.trace(line: sourceLine, storeAddressRegister: nil, storeWidth: 0, into: &builder)
+    }
+
+    /// Spec §7.5's return sequence, shared by `BX LR`, `MOV PC, LR`, and
+    /// `POP`/`LDMFD {..., PC}`. Inside a call target, the frame that label's
+    /// prologue opened is real, so pop it and `ret`. Outside one (Important 2:
+    /// a top-level `BX LR`/`MOV PC, LR` is the ordinary way to end a program with
+    /// no subroutines), there is no frame here to pop — branching to the shared
+    /// exit label ends the program the way it means, instead of popping the host
+    /// prologue's own saved register pairs and returning through garbage.
+    static func emitReturn(insideCallTarget: Bool, into builder: inout AssemblyBuilder) {
+        if insideCallTarget {
+            builder.instruction("ldp     x29, x30, [sp], #16")
+            builder.instruction("ret")
+        } else {
+            builder.instruction("b       Larmd_exit")
+        }
     }
 
     // MARK: - Helpers

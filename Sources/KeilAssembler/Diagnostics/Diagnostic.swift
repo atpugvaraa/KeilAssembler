@@ -13,15 +13,24 @@ struct Diagnostic: Sendable, Equatable {
 struct DiagnosticBag: Sendable {
     private(set) var diagnostics: [Diagnostic] = []
     private(set) var hasErrors = false
+    /// When false, `emit` still records the diagnostic (`diagnostics`/`hasErrors`
+    /// behave identically) but skips the `PerfLog` call. For a scratch bag whose
+    /// contents are discarded wholesale — Spec §5.2's EQU pre-pass being the one
+    /// user today — routing through `PerfLog.error` unconditionally means a
+    /// diagnostic that will never be shown to anyone still prints to the console
+    /// on an otherwise clean build.
+    private let logging: Bool
 
-    init() {}
+    init(logging: Bool = true) {
+        self.logging = logging
+    }
 
     mutating func emit(_ diagnostic: Diagnostic) {
         if diagnostic.severity == .error {
             hasErrors = true
-            PerfLog.error("\(diagnostic.code) at \(diagnostic.range): \(diagnostic.message)")
+            if logging { PerfLog.error("\(diagnostic.code) at \(diagnostic.range): \(diagnostic.message)") }
         } else {
-            PerfLog.warning("\(diagnostic.code) at \(diagnostic.range): \(diagnostic.message)")
+            if logging { PerfLog.warning("\(diagnostic.code) at \(diagnostic.range): \(diagnostic.message)") }
         }
         diagnostics.append(diagnostic)
     }

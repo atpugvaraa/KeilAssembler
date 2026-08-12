@@ -120,7 +120,23 @@ private func words(_ data: Data) -> [UInt32] {
 // little-endian byte layout of each word at the same time.
 
 @Test func preloadFromWordsIsSortedByAddressRegardlessOfInsertionOrder() {
-    let preload = MemoryPreload(words: [0x2000: 0xAABB_CCDD, 0x1000: 0x1122_3344])
+    // Two entries only catch a missing `.sorted()` about half the time (there
+    // are only two possible orderings of a 2-element dictionary). Five entries,
+    // inserted in a deliberately scrambled order, make a coincidental pass
+    // overwhelmingly unlikely (1-in-120, not 1-in-2).
+    let preload = MemoryPreload(words: [
+        0x3000: 0x3333_3333,
+        0x1000: 0x1111_1111,
+        0x5000: 0x5555_5555,
+        0x2000: 0x2222_2222,
+        0x4000: 0x4444_4444,
+    ])
     let data = StartupImage.encode(dataImage: [], preload: preload)
-    #expect(words(data) == [0x1000, 4, 0x1122_3344, 0x2000, 4, 0xAABB_CCDD])
+    #expect(words(data) == [
+        0x1000, 4, 0x1111_1111,
+        0x2000, 4, 0x2222_2222,
+        0x3000, 4, 0x3333_3333,
+        0x4000, 4, 0x4444_4444,
+        0x5000, 4, 0x5555_5555,
+    ])
 }

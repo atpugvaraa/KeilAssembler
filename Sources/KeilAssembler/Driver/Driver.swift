@@ -11,6 +11,11 @@ struct RunResult: Sendable {
     let diagnostics: [Diagnostic]
     let exitCode: Int32
     let standardError: String
+    /// The directory this run's executable, `image.bin`, and `trace.bin` live
+    /// in (Spec §7.9). `Driver.run` deletes its own auto-created directory on
+    /// a successful (exit code 0) run — this is only useful for a caller-
+    /// supplied directory, or for inspecting a failed run before cleaning up.
+    let runDirectory: URL
 
     /// The register state after the last executed instruction, or all zeros.
     var finalRegisters: [UInt32] {
@@ -70,6 +75,10 @@ struct Driver: Sendable {
             throw Failure.compilationProducedNoAssembly(diagnostics.diagnostics)
         }
 
+        // Spec §7.9: an auto-created directory is this call's own temp scratch
+        // space and gets cleaned up on success below; a caller-supplied one is
+        // caller-owned and must never be touched, successful run or not.
+        let ownsDirectory = directory == nil
         let runDirectory = try directory ?? makeRunDirectory()
         PerfLog.info("run directory: \(runDirectory.path)")
 
@@ -87,11 +96,11 @@ struct Driver: Sendable {
 
         let executableURL = runDirectory.appendingPathComponent("program")
         try PerfLog.measure("assemble-and-link") {
-            try invoke(clangURL, arguments: [
-                "-o", executableURL.path,
-                assemblyURL.path,
-                runtimeURL.path,
-            ], in: runDirectory, tool: "clang")
+            try invoke(clangURL, arguments: Self.clangBuildArguments(
+                executable: executableURL.path,
+                assembly: assemblyURL.path,
+                runtime: runtimeURL.path
+            ), in: runDirectory, tool: "clang")
         }
 
         let execution = try PerfLog.measure("run") {
@@ -102,12 +111,31 @@ struct Driver: Sendable {
         let traceData = (try? Data(contentsOf: traceURL)) ?? Data()
         let snapshots = try TraceDecoder.decode(traceData)
 
+        // A successful run has no further debugging use for its own auto-created
+        // directory; a failing one (nonzero exit — a crash, since nothing in this
+        // subset can fail any other way) is exactly when its contents are worth
+        // keeping for a postmortem. `try?`: cleanup failing must never turn a
+        // successful run into a thrown error.
+        if ownsDirectory, execution.status == 0 {
+            try? FileManager.default.removeItem(at: runDirectory)
+        }
+
         return RunResult(
             snapshots: snapshots,
             diagnostics: diagnostics.diagnostics,
             exitCode: execution.status,
-            standardError: execution.errorOutput
+            standardError: execution.errorOutput,
+            runDirectory: runDirectory
         )
+    }
+
+    /// The `clang` invocation that assembles the lowered `.s` file together with
+    /// `armd_rt.c` into the run's executable (Spec §7.9). `-Wall -Wextra`: the
+    /// generated assembly and the runtime should build clean under real
+    /// warnings, not just "no errors" — this doesn't add `-Werror`, so a warning
+    /// still can't fail the build, only surface in `standardError`.
+    static func clangBuildArguments(executable: String, assembly: String, runtime: String) -> [String] {
+        ["-Wall", "-Wextra", "-o", executable, assembly, runtime]
     }
 
     // MARK: - Process plumbing

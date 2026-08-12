@@ -600,3 +600,84 @@ private func firstInstruction(_ source: String) -> Instruction? {
     #expect(bag.diagnostics.map(\.code) == ["E029"])
     #expect(program.lines.count == 1)
 }
+
+// MARK: - Final fix wave: Important 1 — STMFD/LDMFD restricted to `SP!`
+
+@Test func stmfdWithANonSPBaseIsDiagnosedE012() {
+    // Spec §6.3: "General LDM/STM addressing modes: E012, not in this subset" —
+    // the parser accepted any bare register plus an optional `!`, and Lowering
+    // hardcoded R13 regardless of what was written, so `STMFD R5!, {R1}` stored
+    // at R13, decremented R13, and left R5 completely untouched with no
+    // diagnostic anywhere.
+    let (_, bag) = parse("    STMFD R5!, {R1}\n")
+    #expect(bag.diagnostics.map(\.code) == ["E012"])
+}
+
+@Test func stmfdMissingTheWritebackBangIsDiagnosedE012() {
+    // The right base register but a missing `!` is just as much "not the one
+    // spec-legal form" as the wrong base register.
+    let (_, bag) = parse("    STMFD SP, {R1}\n")
+    #expect(bag.diagnostics.map(\.code) == ["E012"])
+}
+
+@Test func ldmfdWithANonSPBaseIsDiagnosedE012() {
+    // Symmetric coverage for LDMFD, the other general-form mnemonic Spec §6.3
+    // restricts identically.
+    let (_, bag) = parse("    LDMFD R5!, {R1}\n")
+    #expect(bag.diagnostics.map(\.code) == ["E012"])
+}
+
+@Test func stmfdWithSpAndWritebackIsNotDiagnosed() {
+    // Positive twin: the one spec-legal spelling must not be flagged.
+    let (_, bag) = parse("    STMFD SP!, {R1}\n")
+    #expect(bag.diagnostics.map(\.code).contains("E012") == false)
+}
+
+// MARK: - Final fix wave: a malformed AREA ALIGN value must not leak as a bogus statement
+
+@Test func areaDiagnosesAMalformedAlignValueInsteadOfLeakingIt() {
+    // Without the fix: `match(.equals)` consumes '=', but the guard against a
+    // non-integer value fails without consuming FOO, so the attribute loop
+    // (which only re-enters on a comma) exits with FOO still sitting in the
+    // token stream. The top-level parse loop then re-dispatches FOO as a bogus
+    // *second* statement — "E013: instruction 'FOO' is not supported" — naming
+    // an entirely unrelated problem instead of the malformed ALIGN value.
+    let (program, bag) = parse("    AREA X, ALIGN=FOO\n")
+    #expect(bag.diagnostics.map(\.code) == ["W003"])
+    #expect(program.lines.count == 1)
+    #expect(program.lines[0].statement == .directive(.area(name: "X", kind: .code, readOnly: true, alignment: 2)))
+}
+
+@Test func areaAlignWithAnIntegerValueIsUnaffected() {
+    let (program, bag) = parse("    AREA X, ALIGN=4\n")
+    #expect(bag.diagnostics.isEmpty)
+    #expect(program.lines[0].statement == .directive(.area(name: "X", kind: .code, readOnly: true, alignment: 4)))
+}
+
+// MARK: - Final fix wave: pin the three previously-unpinned sign placements
+
+@Test func parserPinsAnExplicitPlusSignOnAnImmediateOffset() {
+    // [Rn,#+8] — the leading '+' is optional (the default), but must still
+    // parse. Correct today; pinned because a plan defect already hit this
+    // exact family of sign placements once.
+    #expect(firstInstruction("    LDR R3, [R1, #+8]\n")?.operands == [
+        .register(3),
+        .address(.immediateOffset(base: 1, offset: .integer(8), negated: false, writeBack: false)),
+    ])
+}
+
+@Test func parserPinsANegatedRegisterOffset() {
+    // [Rn,-R3]
+    #expect(firstInstruction("    LDR R1, [R2, -R3]\n")?.operands == [
+        .register(1),
+        .address(.registerOffset(base: 2, offset: 3, negated: true, shift: nil, writeBack: false)),
+    ])
+}
+
+@Test func parserPinsANegatedPostIndexedOffset() {
+    // [Rn],#-4
+    #expect(firstInstruction("    LDR R1, [R2], #-4\n")?.operands == [
+        .register(1),
+        .address(.postIndexed(base: 2, offset: .integer(4), negated: true)),
+    ])
+}

@@ -104,7 +104,7 @@ enum Analyser {
             // on a label still gets its correct value and, if genuinely undefined,
             // its real diagnostic there. This is a third linear pass, not a fixpoint:
             // it runs once, over EQUs only, and never re-visits anything.
-            var scratch = DiagnosticBag()
+            var scratch = DiagnosticBag(logging: false)
             for line in program.lines {
                 if case .directive(.equ(let symbol, let value))? = line.statement {
                     if let resolved = ExpressionEvaluator.evaluate(value, symbols: symbols, here: 0, range: line.range, diagnostics: &scratch) {
@@ -226,6 +226,22 @@ enum Analyser {
             // Pass 1b — EQU constants, now that every label is bound.
             for line in program.lines {
                 if case .directive(.equ(let symbol, let value))? = line.statement {
+                    // Spec §5.1: '.' is "the current position" — meaningful for a data
+                    // directive laid out at a specific address (DCB/DCW/DCD/SPACE each
+                    // record their own position in pass 1), but EQU has no position of
+                    // its own: nothing tracks one for it, so every EQU is evaluated with
+                    // `here: 0` below. `X EQU . + 4` would therefore silently resolve
+                    // against a bogus address 0 rather than anything an implementer
+                    // reading the source would expect. Reject it outright instead.
+                    if expressionReferencesHere(value) {
+                        bag.emit(Diagnostic(
+                            severity: .error, code: "E043",
+                            message: "'.' is not valid inside an EQU expression",
+                            range: line.range,
+                            note: "EQU has no position of its own; reference a label instead"
+                        ))
+                        continue
+                    }
                     if let resolved = ExpressionEvaluator.evaluate(value, symbols: symbols, here: 0, range: line.range, diagnostics: &bag) {
                         bindConstant(symbol, value: resolved, range: line.range)
                     }
@@ -288,6 +304,19 @@ enum Analyser {
         }
         diagnostics = bag
         return result
+    }
+
+    /// Spec §5.1: true when `.` (the current position) appears anywhere in the
+    /// expression tree, including nested inside a unary/binary operator — used
+    /// to reject '.' inside an EQU expression (EQU has no position of its own).
+    private static func expressionReferencesHere(_ expression: Expression) -> Bool {
+        switch expression {
+        case .here: return true
+        case .integer, .symbol: return false
+        case .unary(_, let operand): return expressionReferencesHere(operand)
+        case .binary(_, let left, let right):
+            return expressionReferencesHere(left) || expressionReferencesHere(right)
+        }
     }
 
     /// A boundary of 0 or 1 is a no-op (nothing is unaligned relative to it); guarding
@@ -404,7 +433,7 @@ extension Analyser {
                 let sourcesCarryFromShifter: Bool
                 switch instruction.mnemonic {
                 case .tst, .teq: sourcesCarryFromShifter = true
-                case .mov, .and, .orr, .eor, .bic: sourcesCarryFromShifter = instruction.setsFlags
+                case .mov, .mvn, .and, .orr, .eor, .bic: sourcesCarryFromShifter = instruction.setsFlags
                 default: sourcesCarryFromShifter = false
                 }
                 if sourcesCarryFromShifter {
@@ -430,6 +459,25 @@ extension Analyser {
                             note: "Spec §9 D8: ARM7 saturates, A64 wraps at 32"
                         ))
                     }
+                }
+
+            case .registerList(let registers):
+                // Spec §6.3: PUSH/STMFD *read* every register in the list (to store
+                // its value) — the same kind of read D2 already forbids for every
+                // other operand shape above, so R15 in a PUSH/STMFD list gets the
+                // identical E021. POP/LDMFD is the opposite direction (R15 there is
+                // *written*, the canonical subroutine-return idiom `POP {..., PC}`
+                // that pairs with `PUSH {..., LR}`) — Lowering handles that as the
+                // real function return (Spec §7.5), so it is deliberately not
+                // diagnosed here.
+                let isPush = instruction.mnemonic == .push || instruction.mnemonic == .stmfd
+                if isPush, registers.contains(15) {
+                    diagnostics.emit(Diagnostic(
+                        severity: .error, code: "E021",
+                        message: "R15 cannot be used as a data operand",
+                        range: instruction.range,
+                        note: "Spec §9 D2: R15 holds a synthetic address for display only; PUSH/STMFD read the register's value"
+                    ))
                 }
 
             default:

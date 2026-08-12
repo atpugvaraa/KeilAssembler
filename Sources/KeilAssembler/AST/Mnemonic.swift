@@ -78,6 +78,20 @@ extension Mnemonic {
         self = parts.mnemonic
     }
 
+    /// Spec §6.3: only these have an architectural `S` (flag-setting) form — the
+    /// data-processing and multiply mnemonics. Branches, `NOP`, `ADR`, the stack
+    /// ops, and the load/store family do not, so a trailing "S" left over after
+    /// stripping one of *those* mnemonics is not a flag suffix at all — it is
+    /// either part of a genuine condition code (`BLS` = `B` + `LS`) or outright
+    /// invalid input (`LDRS`, `PUSHS`, ...). Gating the S-strip on this set is
+    /// what keeps `BLS` from being swallowed as an unconditional `BL` that also
+    /// (spuriously) "sets flags", since candidates sort longest-first and `bl`
+    /// is tried before `b`.
+    static let flagSettable: Set<Mnemonic> = [
+        .mov, .mvn, .add, .adc, .sub, .sbc, .rsb, .rsc,
+        .and, .orr, .eor, .bic, .cmp, .cmn, .tst, .teq, .mul, .mla,
+    ]
+
     static func decompose(_ text: String) -> (mnemonic: Mnemonic, condition: Condition, setsFlags: Bool)? {
         let upper = text.uppercased()
         let candidates = Mnemonic.allCases
@@ -88,12 +102,13 @@ extension Mnemonic {
             var rest = String(upper.dropFirst(mnemonic.rawValue.count))
             var setsFlags = false
             var condition = Condition.al
+            let canSetFlags = flagSettable.contains(mnemonic)
 
-            if rest.hasSuffix("S"), rest.count == 1 || rest.count == 3 {
+            if canSetFlags, rest.hasSuffix("S"), rest.count == 1 || rest.count == 3 {
                 setsFlags = true
                 rest = String(rest.dropLast())
             }
-            if rest.hasPrefix("S"), rest.count == 3 {   // ADDSEQ
+            if canSetFlags, rest.hasPrefix("S"), rest.count == 3 {   // ADDSEQ
                 setsFlags = true
                 rest = String(rest.dropFirst())
             }

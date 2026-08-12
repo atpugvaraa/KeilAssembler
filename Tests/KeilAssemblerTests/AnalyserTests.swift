@@ -1,3 +1,4 @@
+import Darwin
 import Testing
 @testable import KeilAssembler
 
@@ -815,6 +816,161 @@ private func analyse(_ source: String) -> (AnalysedProgram, DiagnosticBag) {
     """)
     #expect(bag.diagnostics.map(\.code).contains("E014") == false)
     #expect(bag.hasErrors == false)
+}
+
+// MARK: - Final fix wave: Critical 1 — `Analyser.check` had no `.registerList` case
+
+@Test func analyserRejectsPushingR15() {
+    // `Analyser.check`'s operand loop has no `.registerList` case at all, so a
+    // register list — PUSH/POP/STMFD/LDMFD's only operand — is never inspected
+    // for R15, unlike every other operand shape. `PUSH {R4, PC}` genuinely
+    // *reads* R15's value (to store it), the same kind of read Spec §9 D2
+    // already forbids for every other operand shape (`ADD R1, R15, #4`, etc.),
+    // so it must get the same E021, not silently pass through with a phantom
+    // register value stored to memory.
+    let (_, bag) = analyse("""
+        AREA PROGRAM, CODE, READONLY
+        ENTRY
+    MAIN
+        PUSH {R4, PC}
+    """)
+    #expect(bag.diagnostics.map(\.code).contains("E021"))
+}
+
+@Test func analyserRejectsStmfdOfR15Too() {
+    // Symmetric coverage for STMFD, the other "push"-shaped register-list form.
+    let (_, bag) = analyse("""
+        AREA PROGRAM, CODE, READONLY
+        ENTRY
+    MAIN
+        STMFD SP!, {R4, PC}
+    """)
+    #expect(bag.diagnostics.map(\.code).contains("E021"))
+}
+
+@Test func analyserAcceptsPoppingIntoR15WithNoDiagnostic() {
+    // `POP {..., PC}` is the canonical ARM subroutine return (the natural
+    // partner to `PUSH {..., LR}`) — R15 there is a *destination*, lowered as
+    // the real function return (Spec §7.5), not a data read. It must not be
+    // flagged the way PUSH-of-R15 is.
+    let (_, bag) = analyse("""
+        AREA PROGRAM, CODE, READONLY
+        ENTRY
+    MAIN
+        PUSH {R4, LR}
+        POP {R4, PC}
+    """)
+    #expect(bag.diagnostics.map(\.code).contains("E021") == false)
+    #expect(bag.hasErrors == false)
+}
+
+// MARK: - Final fix wave: MVN was missing from the shifter-carry (Spec §9 D1) set
+
+@Test func analyserWarnsAboutUnmodelledShifterCarryOnMvns() {
+    // Spec §9 D1 names MOVS, ANDS, ORRS, EORS, BICS, TST, TEQ. MVN is a
+    // data-processing mnemonic with a flag-setting form and a shifted operand
+    // just like MOV, sourcing carry from the same barrel shifter on real
+    // ARM7 — but `.mvn` was missing from `sourcesCarryFromShifter`'s switch, so
+    // `MVNS Rd, Rm, LSL #2` fell to `default: false` and got no W010 at all.
+    let (_, bag) = analyse("""
+        AREA PROGRAM, CODE, READONLY
+        ENTRY
+    MAIN
+        MVNS R3, R1, LSL #2
+    """)
+    #expect(bag.diagnostics.map(\.code).contains("W010"))
+}
+
+// MARK: - Final fix wave: EQU must not silently resolve '.' against a bogus position
+
+@Test func equRejectsAReferenceToTheCurrentPosition() {
+    // Spec §5.2's EQU pass evaluates every EQU with `here: 0` — pass 1 tracks a
+    // real per-line position for DCB/DCW/DCD/SPACE (`dataAddresses`), but EQU
+    // has no position of its own and none is threaded through. `X EQU . + 4`
+    // therefore silently resolved to 4, not to any position an implementer
+    // reading the source would expect. Reject '.' inside an EQU expression
+    // instead of guessing against address 0.
+    let (_, bag) = analyse("""
+        AREA PROGRAM, CODE, READONLY
+        ENTRY
+    MAIN
+        MOV R1, #1
+    X EQU . + 4
+    """)
+    #expect(bag.diagnostics.map(\.code).contains("E043"))
+}
+
+@Test func equWithoutAHereReferenceStillResolvesNormally() {
+    // Negative twin: an ordinary EQU with no '.' anywhere in its expression
+    // must not be caught by the new check.
+    let (analysed, bag) = analyse("""
+        AREA PROGRAM, CODE, READONLY
+        ENTRY
+    MAIN
+        MOV R1, #1
+    SIZE EQU 4 + 4
+    """)
+    #expect(bag.diagnostics.map(\.code).contains("E043") == false)
+    #expect(analysed.symbols.constants["SIZE"] == 8)
+}
+
+// MARK: - Final fix wave: pass 0's scratch bag must not print a phantom diagnostic
+
+/// Raw POSIX pipe/dup2, not `Foundation.Pipe`: this test target must not import
+/// Foundation at all — `Foundation.Expression` (macOS 15's Predicate type)
+/// collides with this package's own `Expression` (Spec §5.1 AST node) and makes
+/// every `.binary(...)`/`.integer(...)` case-shorthand in this file ambiguous.
+private func captureStandardOutput(_ body: () -> Void) -> String {
+    fflush(stdout)
+    var fds: [Int32] = [0, 0]
+    pipe(&fds)
+    let readEnd = fds[0]
+    let writeEnd = fds[1]
+    let originalStdout = dup(STDOUT_FILENO)
+    dup2(writeEnd, STDOUT_FILENO)
+    close(writeEnd)
+
+    body()
+
+    fflush(stdout)
+    dup2(originalStdout, STDOUT_FILENO)   // restores stdout and closes the write end's last reference
+    close(originalStdout)
+
+    var captured = [UInt8]()
+    var buffer = [UInt8](repeating: 0, count: 4096)
+    while true {
+        let count = read(readEnd, &buffer, buffer.count)
+        guard count > 0 else { break }
+        captured.append(contentsOf: buffer[0..<count])
+    }
+    close(readEnd)
+    return String(decoding: captured, as: UTF8.self)
+}
+
+@Test func passZeroDoesNotLogAPhantomDiagnosticForALabelReferencingEqu() {
+    // Spec §5.2 pass 0 (the EQU pre-pass): a label-referencing EQU legitimately
+    // cannot resolve yet (labels aren't bound until pass 1 finishes), so pass 0
+    // evaluates into a scratch `DiagnosticBag` specifically so that failure is
+    // discarded and never surfaced. But `DiagnosticBag.emit` unconditionally
+    // calls `PerfLog.error`, coupling storage to logging — so even a
+    // *discarded* scratch diagnostic still prints "E031 ... is not defined" to
+    // the console during an entirely clean build. The probe symbol name is
+    // unique to this test so a concurrently-running test's own, legitimate
+    // logging can't coincidentally contain it.
+    let source = """
+        AREA PROGRAM, CODE, READONLY
+        ENTRY
+    MAIN
+        MOV R1, #1
+        AREA STORAGE, DATA, READONLY
+    ZZZ_PASS0_PHANTOM_PROBE DCD &00000012
+    OFFSET EQU ZZZ_PASS0_PHANTOM_PROBE
+    """
+    let output = captureStandardOutput {
+        let (_, bag) = analyse(source)
+        #expect(bag.hasErrors == false)
+    }
+    #expect(output.contains("ZZZ_PASS0_PHANTOM_PROBE") == false)
 }
 
 @Test func analyserAlignZeroFromSourceDoesNotHangOrCrash() {

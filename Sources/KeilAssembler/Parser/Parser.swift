@@ -218,9 +218,26 @@ struct Parser {
             case "READONLY":  readOnly = true
             case "READWRITE": readOnly = false
             case "ALIGN":
-                if match(.equals), case .integer(let value) = peek() {
-                    advance()
-                    alignment = Int(value)
+                if match(.equals) {
+                    if case .integer(let value) = peek() {
+                        advance()
+                        alignment = Int(value)
+                    } else {
+                        // Without this, `match(.equals)` has already consumed '=',
+                        // but the non-integer value is left completely unconsumed:
+                        // the attribute loop only re-enters on a comma, so it exits
+                        // here, and the top-level parse loop re-dispatches the
+                        // stray token (e.g. `FOO` in `ALIGN=FOO`) as a bogus second
+                        // statement — "E013: instruction 'FOO' is not supported",
+                        // naming the wrong problem entirely.
+                        diagnostics.emit(Diagnostic(
+                            severity: .warning, code: "W003",
+                            message: "AREA attribute 'ALIGN' has a malformed value and is ignored",
+                            range: current.range,
+                            note: "write ALIGN=n, where n is an integer"
+                        ))
+                        if peek() != .endOfLine, peek() != .endOfFile { advance() }
+                    }
                 }
             default:
                 diagnostics.emit(Diagnostic(
@@ -475,6 +492,7 @@ struct Parser {
                 guard let operand2 = parseOperand2(into: &diagnostics) else { return nil }
                 return .operand2(operand2)
             }
+            let registerRange = current.range
             advance()
             // `Rn!` outside `[...]` is only meaningful for `STMFD`/`LDMFD`'s base
             // register — e.g. `STMFD SP!, {R1, R4}` (Spec §6.3), the only
@@ -486,7 +504,22 @@ struct Parser {
             // register (e.g. `ADD R1!, R2, R3`), discarding the E040 that
             // `parseInstruction`'s post-loop check exists to catch.
             if mnemonic == .stmfd || mnemonic == .ldmfd {
-                _ = match(.bang)
+                let hasWriteback = match(.bang)
+                // Spec §6.3: "General LDM/STM addressing modes: E012, not in this
+                // subset" — only `SP!` is supported. A different base register, or
+                // a missing `!`, is the general form; Lowering hardcodes R13 and
+                // always writes back regardless of what was parsed here, so
+                // silently accepting either would store at the wrong register (or
+                // the right one without ever announcing the writeback) with no
+                // diagnostic at all.
+                if number != 13 || !hasWriteback {
+                    diagnostics.emit(Diagnostic(
+                        severity: .error, code: "E012",
+                        message: "general LDM/STM is not supported in this subset",
+                        range: registerRange,
+                        note: "write `STMFD SP!, {...}` / `LDMFD SP!, {...}`"
+                    ))
+                }
             }
             return .register(number)
         }

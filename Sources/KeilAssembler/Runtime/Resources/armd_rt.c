@@ -81,6 +81,13 @@ void *armd_init(void) {
 
     armd_load_image();
     armd_trace_file = fopen("trace.bin", "wb");
+    // The trace is this tool's entire product, and a crash is exactly when its
+    // history matters most — but `fopen`'s default full buffering only reaches
+    // disk when the buffer fills or `armd_fini` flushes it, and a crash (a
+    // signal, not a normal exit) skips `armd_fini` entirely. Unbuffered I/O
+    // makes every `fwrite` below its own `write()` syscall, so whatever
+    // executed before a crash survives it. Cost is nil at ~96 bytes/instruction.
+    if (armd_trace_file) { setvbuf(armd_trace_file, NULL, _IONBF, 0); }
     return armd_memory;
 }
 

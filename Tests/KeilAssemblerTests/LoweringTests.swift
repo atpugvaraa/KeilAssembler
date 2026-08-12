@@ -452,14 +452,29 @@ MAIN
     // *display slot* instead of returning. Task 16 implements the real lowering:
     // identical to `BX LR` (Spec §7.5) — pop the frame, then `ret` — not a plain
     // register move and not an error anymore.
-    let (assembly, bag) = lower(preamble + "\n    MOV PC, LR\n")
+    //
+    // Final fix wave (Important 2): the frame this pops is only real *inside* a
+    // BL call target — CALLEE below is one — so this must be the scenario, not
+    // top-level MAIN (see `topLevelReturnBranchesToExitInsteadOfPoppingAnUnpushedFrame`
+    // for the case that used to pop a frame nobody pushed).
+    let (assembly, bag) = lower("""
+        AREA PROGRAM, CODE, READONLY
+        ENTRY
+    MAIN
+        BL CALLEE
+    CALLEE
+        MOV PC, LR
+    """)
     #expect(bag.hasErrors == false)
     let text = assembly ?? ""
     #expect(text.contains("ldp     x29, x30, [sp], #16"))
     #expect(text.contains("ret"))
-    // It must not fall through to the ordinary MOV path (which would store into
-    // R15's display slot at offset 60 instead of returning).
-    #expect(!text.contains("str     w11, [x27, #60]"))
+    // It must not fall through to the ordinary MOV path, which would move LR's
+    // *value* into R15's display slot instead of returning. (Every instruction
+    // legitimately writes its own address to that same slot for PC display —
+    // Important 4 below — so the signature to rule out is specifically "LR's
+    // loaded value moved straight into w11, then stored to R15's slot".)
+    #expect(!text.contains("mov     w11, w10\n        str     w11, [x27, #60]"))
 }
 
 @Test func loweringRefusesToEmitWhenAnOperandIsInvalidDuringLowering() {
@@ -691,11 +706,51 @@ MAIN
     // Important 4: `BX LR` had no dedicated Lowering test even though it's one of
     // the two return-sequence idioms named in the brief — exactly where Critical 1
     // lived. Positive companion to `malformedBXProducesADiagnosticInsteadOfSilentlyReturning`.
-    let (assembly, bag) = lower(preamble + "\n    BX LR\n")
+    //
+    // Final fix wave (Important 2): as with `MOV PC, LR`, the frame this pops is
+    // only real inside a BL call target.
+    let (assembly, bag) = lower("""
+        AREA PROGRAM, CODE, READONLY
+        ENTRY
+    MAIN
+        BL CALLEE
+    CALLEE
+        BX LR
+    """)
     #expect(bag.hasErrors == false)
     let text = assembly ?? ""
     #expect(text.contains("ldp     x29, x30, [sp], #16"))
     #expect(text.contains("ret"))
+}
+
+// MARK: - Final fix wave (Important 2): a top-level return has no frame to pop
+
+@Test func movPcLrAtTopLevelBranchesToExitInsteadOfPoppingAnUnpushedFrame() {
+    // `MOV R1, #0x12` / `MOV PC, LR` at the top of MAIN — never reached via `BL`,
+    // so `callTargets` never opened a frame for MAIN — used to lower to the same
+    // `ldp x29, x30, [sp], #16` / `ret` sequence a real callee uses, popping
+    // frames that were never pushed here (the host `_main` prologue's own
+    // x27/x28 pair, then x29/x30) and returning through garbage. It must branch
+    // to the shared exit label instead, matching the one frame this program
+    // actually has open.
+    let (assembly, bag) = lower(preamble + "\n    MOV PC, LR\n")
+    #expect(bag.hasErrors == false)
+    let text = assembly ?? ""
+    #expect(text.contains("b       Larmd_exit"))
+    // The shared epilogue (Spec §7.9) unconditionally ends with its own
+    // `ldp x29, x30, [sp], #16` / `ret` — that one instance is always present
+    // and correct. What must NOT happen is a *second* one from this MOV.
+    #expect(text.components(separatedBy: "ldp     x29, x30, [sp], #16").count - 1 == 1)
+}
+
+@Test func bxLrAtTopLevelBranchesToExitInsteadOfPoppingAnUnpushedFrame() {
+    // Same defect, `BX LR` spelling — the exact repro from the review: `MOV
+    // R1,#0x12` / `BX LR` with nothing ever calling into MAIN via `BL`.
+    let (assembly, bag) = lower(preamble + "\n    BX LR\n")
+    #expect(bag.hasErrors == false)
+    let text = assembly ?? ""
+    #expect(text.contains("b       Larmd_exit"))
+    #expect(text.components(separatedBy: "ldp     x29, x30, [sp], #16").count - 1 == 1)
 }
 
 @Test func adrMaterialisesTheLabelAddressNotItsContents() {
@@ -725,4 +780,65 @@ MAIN
     let text = lower(preamble + "\n    STMFD SP!, {R1, R4}\n").0 ?? ""
     #expect(text.contains("ldr     w9, [x27, #52]"))    // R13
     #expect(text.contains("str     w11, [x28, w9, uxtw]"))
+}
+
+// MARK: - Final fix wave: Critical 1 — `POP {..., PC}` is the real function return
+
+@Test func popWithPCLowersToTheReturnSequenceInsideACallTarget() {
+    // `POP {R4, PC}` is the canonical ARM subroutine return — the natural
+    // partner to `PUSH {R4, LR}`. Before this fix, R15 in a POP/LDMFD list was
+    // treated exactly like any other register: stored into R15's *display*
+    // slot (`str ..., [x27, #60]`) and nothing else, so the callee fell through
+    // with its BL-target frame never popped, corrupting the host stack for
+    // whatever ran next. The chosen fix lowers it as the real return: pop the
+    // other registers normally, skip R15's display slot entirely (its value
+    // gets overwritten by Important 4's per-instruction PC write anyway, and
+    // storing the popped word there would show a stale return address instead
+    // of "this instruction's own address"), then the same ldp/ret CALLEE's own
+    // BL-opened frame expects.
+    let (assembly, bag) = lower("""
+        AREA PROGRAM, CODE, READONLY
+        ENTRY
+    MAIN
+        BL CALLEE
+    CALLEE
+        PUSH {R4, LR}
+        MOV R4, #1
+        POP {R4, PC}
+    """)
+    #expect(bag.hasErrors == false)
+    let text = assembly ?? ""
+    // R4 (slot 0, the lower register) is still popped and stored normally.
+    #expect(text.contains("ldr     w11, [x28, w9, uxtw]"))
+    #expect(text.contains("str     w11, [x27, #16]"))   // R4
+    // SP still advances by both registers' worth (8 bytes), not just R4's.
+    #expect(text.contains("add     w9, w9, #8"))
+    // R15's slot is never written from the popped word — the buggy sequence
+    // would be slot 1's load immediately followed by a store to offset 60.
+    #expect(!text.contains("ldr     w11, [x28, w12, uxtw]\n        str     w11, [x27, #60]"))
+    // And it actually returns, inside the call target that pushed the frame.
+    #expect(text.contains("ldp     x29, x30, [sp], #16"))
+    #expect(text.contains("ret"))
+}
+
+@Test func popWithPCAtTopLevelBranchesToExitRatherThanPoppingAnUnpushedFrame() {
+    // Same "no frame to pop outside a call target" rule Important 2 applies to
+    // `BX LR`/`MOV PC, LR` applies here too.
+    let text = lower(preamble + "\n    PUSH {R4, LR}\n    POP {R4, PC}\n").0 ?? ""
+    #expect(text.contains("b       Larmd_exit"))
+    #expect(text.components(separatedBy: "ldp     x29, x30, [sp], #16").count - 1 == 1)
+}
+
+// MARK: - Final fix wave: Important 4 — every instruction records its own R15/PC
+
+@Test func everyLoweredInstructionWritesItsOwnAddressToR15() {
+    // Spec §3/§7.7/§9 D2: R15 holds "the synthetic ARM7 address of the current
+    // instruction, for display." No emitter site wrote it at all before this
+    // fix — `armd_state.r[15]` (and therefore every trace record's `pc` field)
+    // was always 0. MAIN's second instruction sits 4 bytes after MAIN itself
+    // (Spec §5.2: CODE labels advance 4 bytes per instruction).
+    let text = lower(preamble + "\n    MOV R1, #1\n    MOV R2, #2\n").0 ?? ""
+    #expect(text.contains("movz    w11, #0x\(String(Analyser.origin, radix: 16))"))
+    #expect(text.contains("movz    w11, #0x\(String(Analyser.origin + 4, radix: 16))"))
+    #expect(text.contains("str     w11, [x27, #60]"))   // R15
 }
