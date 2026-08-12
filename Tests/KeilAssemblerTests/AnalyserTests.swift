@@ -737,6 +737,58 @@ private func analyse(_ source: String) -> (AnalysedProgram, DiagnosticBag) {
     #expect(bag.diagnostics.map(\.code).contains("E021"))
 }
 
+// MARK: - Review fix round: register-specified shift count and MOVS PC, LR
+
+@Test func analyserFlagsR15AsARegisterSpecifiedShiftCount() {
+    // Spec §9 D2's blanket rule ("reading R15 as a data operand is E021") covers a
+    // shift *count* supplied by a register (`Rm, LSL Rs`) too, not just the shifted
+    // operand's base register. `ShiftSpec.amountRegister` is real, parseable input
+    // (`ADD R1, R2, R3, LSL R15`), but the `.shifted` case only ever inspected the
+    // base `register`, never `shift.amountRegister` — so this read of R15 as a shift
+    // count reached the analyser and was accepted with zero diagnostics, silently
+    // producing a wrong shift amount downstream. A wrong implementation that still
+    // only checks the base register would pass every other R15 test in this file
+    // while missing this one.
+    let (_, bag) = analyse("""
+        AREA PROGRAM, CODE, READONLY
+        ENTRY
+    MAIN
+        ADD R1, R2, R3, LSL R15
+    """)
+    #expect(bag.diagnostics.map(\.code).contains("E021"))
+}
+
+@Test func analyserDoesNotExemptMovsPcLrFromR15Checking() {
+    // The `MOV PC, LR` carve-out exists for exactly the unsuffixed return idiom Spec
+    // §7.5 names. `MOVS PC, LR` is a different instruction: on real ARM7 the `S`
+    // additionally restores CPSR from SPSR, and Spec §9 D6 states plainly that this
+    // transpiler models no banked registers and no SPSR — so silently lowering
+    // `MOVS PC, LR` as a plain return would drop that restore with no diagnostic at
+    // all. A wrong implementation that checks `mnemonic == .mov` without also
+    // requiring `!setsFlags` would exempt this alongside the legitimate idiom.
+    let (_, bag) = analyse("""
+        AREA PROGRAM, CODE, READONLY
+        ENTRY
+    MAIN
+        MOVS PC, LR
+    """)
+    #expect(bag.diagnostics.map(\.code).contains("E021"))
+}
+
+@Test func analyserStillAcceptsThePlainMovPcLrIdiom() {
+    // Pins the carve-out from the other side once `!instruction.setsFlags` is added:
+    // the legitimate, unsuffixed `MOV PC, LR` must still produce no E021. Without
+    // this, a wrong fix could overcorrect (e.g. dropping the carve-out entirely)
+    // and reject the return idiom Spec §7.5 requires to keep working.
+    let (_, bag) = analyse("""
+        AREA PROGRAM, CODE, READONLY
+        ENTRY
+    MAIN
+        MOV PC, LR
+    """)
+    #expect(bag.diagnostics.map(\.code).contains("E021") == false)
+}
+
 @Test func analyserRejectsAComputedBranchThroughARegisterOtherThanLR() {
     // Spec §7.5: only `BX LR` is lowered; any other `BX Rm` is E014. Because a
     // single-operand instruction's sole register always parses as the *trailing*

@@ -334,7 +334,13 @@ extension Analyser {
         // Rd, Operand2 for MOV/MVN"), so dropping just this one exact pattern from
         // the loop below — rather than exempting operand[0] in general — keeps
         // `CMP R15, ...`, `ADD R15, R1, #4`, etc. flagged as before.
+        // `MOVS PC, LR` is deliberately excluded from the carve-out: Spec §7.5 names
+        // only the unsuffixed form as the lowered idiom. On real ARM7 the `S` also
+        // restores CPSR from SPSR, and Spec §9 D6 models no banked registers/SPSR —
+        // so `MOVS PC, LR` must fall through to E021 rather than being waved past as
+        // a plain return that silently drops the restore.
         let isMovPCFromLR = instruction.mnemonic == .mov
+            && !instruction.setsFlags
             && instruction.operands.count == 2
             && instruction.operands[0] == .register(15)
             && instruction.operands[1] == .operand2(.register(14))
@@ -378,8 +384,11 @@ extension Analyser {
             case .operand2(.shifted(let register, let shift)):
                 // D2 is a blanket rule on *reading* R15 as data — the shifted
                 // operand's base register is read before the shift is applied, same
-                // as the bare-register and immediate forms above.
-                if register == 15 {
+                // as the bare-register and immediate forms above. A register-
+                // specified shift *count* (`Rm, LSL Rs`) is the same kind of read:
+                // `shift.amountRegister` is consulted to compute the shift, so R15
+                // there is read as data too, not just as the base.
+                if register == 15 || shift.amountRegister == 15 {
                     diagnostics.emit(Diagnostic(
                         severity: .error, code: "E021",
                         message: "R15 cannot be used as a data operand",
