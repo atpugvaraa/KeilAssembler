@@ -2703,6 +2703,10 @@ Expected: FAIL with `type 'Analyser' has no member 'isEncodableModifiedImmediate
 
 ```swift
 extension Analyser {
+    /// Spec §9 D1 applies only where C comes from the barrel shifter. ADDS/SUBS/CMP/CMN
+    /// take C and V from the ALU and match ARM7 exactly.
+    static let shifterCarryMnemonics: Set<Mnemonic> = [.mov, .mvn, .and, .orr, .eor, .bic, .tst, .teq]
+
     /// Spec §6.2 / [ARMARM]: an 8-bit value rotated right by an even amount.
     /// Enforced as a diagnostic even though the emitted AArch64 has no such
     /// restriction — the transpiler must not accept what real armasm rejects.
@@ -2721,9 +2725,19 @@ extension Analyser {
         address: UInt32,
         diagnostics: inout DiagnosticBag
     ) {
+        // Spec §7.5 lowers `MOV PC, LR` as a return, so that one form must survive the
+        // R15 check below. `MOVS PC, LR` must not: on ARM7 it also restores CPSR from
+        // SPSR, which Spec §9 D6 says this transpiler does not model at all.
+        let isReturnIdiom = instruction.mnemonic == .mov
+            && !instruction.setsFlags
+            && instruction.operands.count == 2
+            && instruction.operands[0] == .register(15)
+            && (instruction.operands[1] == .register(14)
+                || instruction.operands[1] == .operand2(.register(14)))
+
         for operand in instruction.operands {
             switch operand {
-            case .register(15):
+            case .register(15) where !isReturnIdiom:
                 diagnostics.emit(Diagnostic(
                     severity: .error, code: "E021",
                     message: "R15 cannot be used as a data operand",
@@ -2756,8 +2770,22 @@ extension Analyser {
                     note: "Spec §9 D2: R15 holds a synthetic address for display only"
                 ))
 
-            case .operand2(.shifted(_, let shift)):
-                if instruction.setsFlags || instruction.mnemonic.isComparison {
+            case .operand2(.shifted(let shiftBase, let shift)):
+                if shiftBase == 15 || shift.amountRegister == 15 {
+                    // A register supplying a shift count is read as data, so D2 applies
+                    // to it exactly as it does to the shifted register itself.
+                    diagnostics.emit(Diagnostic(
+                        severity: .error, code: "E021",
+                        message: "R15 cannot be used as a data operand",
+                        range: instruction.range,
+                        note: "Spec §9 D2: R15 holds a synthetic address for display only"
+                    ))
+                }
+                // Spec §9 D1 covers only the instructions whose C comes from the barrel
+                // shifter. ADDS/SUBS/CMP/CMN take C and V from the ALU and match ARM7
+                // exactly, so warning on them would be false and would teach the user
+                // to ignore W010.
+                if instruction.setsFlags, Self.shifterCarryMnemonics.contains(instruction.mnemonic) {
                     diagnostics.emit(Diagnostic(
                         severity: .warning, code: "W010",
                         message: "carry flag result of the barrel shifter is not modelled; C is unchanged",
@@ -2787,10 +2815,13 @@ extension Analyser {
             }
         }
 
-        // Spec §6.1: NV is deprecated. `Condition` cannot represent it, so the
-        // parser's suffix decode already fails; this catches the `MOVNV` spelling
-        // that decomposes as mnemonic MOV with an unparsed suffix.
-        if instruction.mnemonic == .bx, case .register(let register)? = instruction.operands.first, register != 14 {
+        // Spec §7.5 lowers only `BX LR`; any other register is a computed branch.
+        // Note the parser yields `BX`'s operand as `.operand2(.register(n))`, never a
+        // bare `.register(n)`, because a trailing register goes through parseOperand2 —
+        // matching on `.register` here would make this check dead.
+        if instruction.mnemonic == .bx,
+           case .operand2(.register(let register))? = instruction.operands.first,
+           register != 14 {
             diagnostics.emit(Diagnostic(
                 severity: .error, code: "E014",
                 message: "computed branch through R\(register) is not supported",
