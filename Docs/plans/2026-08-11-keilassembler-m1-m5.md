@@ -3006,7 +3006,7 @@ git commit -m "feat: startup image encoder for data and preload blobs"
 
 **Interfaces:**
 - Consumes: `Analyser.origin`, `SourceRange`.
-- Produces: `AssemblyBuilder` with `comment(_:)`, `label(_:)`, `instruction(_:)`, `directive(_:)`, `text`; `Emitter` with `cpsrOffset = 0x40`, `loadRegister(_:into:_:)`, `storeRegister(_:from:_:)`, `materialiseImmediate(_:into:_:)`, `saveFlags(_:)`, `restoreFlags(_:)`, `prologue(into:)`, `epilogue(into:)`, `armLabel(_:)`, `trace(line:storeAddressRegister:storeWidth:into:)`. Used verbatim by Tasks 14–16.
+- Produces: `AssemblyBuilder` with `comment(_:)`, `label(_:)`, `instruction(_:)`, `directive(_:)`, `text`; `Emitter` with `cpsrOffset = 0x40`, `loadRegister(_:into:_:)`, `storeRegister(_:from:_:)`, `materialiseImmediate(_:into:_:)`, `saveFlags(into:)`, `restoreFlags(into:)`, `prologue(entryLabel:into:)`, `epilogue(into:)`, `armLabel(_:)`, `trace(line:storeAddressRegister:storeWidth:into:)`. Used verbatim by Tasks 14–16. `prologue` needs `entryLabel` to emit §7.9's `b Lentry`; there is no one-argument form.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -3118,12 +3118,17 @@ enum Emitter {
 
     /// movz/movk unconditionally: always two instructions, always correct.
     /// ARM7-side legality is a separate diagnostic, enforced in Task 11.
-    static func materialiseImmediate(_ value: UInt32, into hostRegister: String, into builder: inout AssemblyBuilder) {
+    /// `radix` affects only the text: `as` assembles `#0x7` and `#7` identically.
+    /// Operand2 values read better in hex, line numbers and widths in decimal.
+    static func materialiseImmediate(
+        _ value: UInt32, into hostRegister: String, radix: Int = 16, into builder: inout AssemblyBuilder
+    ) {
         let low = value & 0xFFFF
         let high = value >> 16
-        builder.instruction("movz    \(hostRegister), #0x\(String(low, radix: 16))")
+        let prefix = radix == 16 ? "0x" : ""
+        builder.instruction("movz    \(hostRegister), #\(prefix)\(String(low, radix: radix))")
         if high != 0 {
-            builder.instruction("movk    \(hostRegister), #0x\(String(high, radix: 16)), lsl #16")
+            builder.instruction("movk    \(hostRegister), #\(prefix)\(String(high, radix: radix)), lsl #16")
         }
     }
 
@@ -3149,10 +3154,10 @@ enum Emitter {
         storeWidth: Int,
         into builder: inout AssemblyBuilder
     ) {
-        materialiseImmediate(UInt32(line), into: "w0", into: &builder)
+        materialiseImmediate(UInt32(line), into: "w0", radix: 10, into: &builder)
         if let storeAddressRegister {
             builder.instruction("mov     w1, \(storeAddressRegister)")
-            materialiseImmediate(UInt32(storeWidth), into: "w2", into: &builder)
+            materialiseImmediate(UInt32(storeWidth), into: "w2", radix: 10, into: &builder)
         } else {
             builder.instruction("mov     w1, wzr")
             builder.instruction("mov     w2, wzr")
