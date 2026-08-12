@@ -138,6 +138,18 @@ extension Lowering {
                   let source = instruction.operands.dropFirst().first else {
                 unsupported(instruction, into: &diagnostics); return
             }
+            // Spec §7.5 names `MOV PC, LR` alongside `BX LR` as the sanctioned
+            // function-return idiom — `Analyser.check` deliberately carves it out
+            // of E021 for exactly this reason. But the real lowering (an `ldp`/
+            // `ret` pair) is Task 16's, not this task's. Falling through to the
+            // ordinary MOV path below would silently store LR's value into R15's
+            // *display slot* instead of returning — valid-looking assembly, wrong
+            // control flow, and no diagnostic. Defer it exactly like `BX LR`
+            // already is: loudly, via E013, until Task 16 implements it for real.
+            if instruction.mnemonic == .mov, !instruction.setsFlags,
+               destination == 15, source == .operand2(.register(14)) {
+                unsupported(instruction, into: &diagnostics); return
+            }
             materialise(source, symbols: symbols, address: address, range: range, into: &builder, diagnostics: &diagnostics)
             if instruction.mnemonic == .mvn {
                 builder.instruction("mvn     w11, w10")

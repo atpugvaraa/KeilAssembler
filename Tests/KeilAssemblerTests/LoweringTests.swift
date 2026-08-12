@@ -441,3 +441,71 @@ MAIN
     #expect(!text.contains("b.al"))
     #expect(!text.contains("Lskip_"))
 }
+
+// MARK: - Review fixes (Task 15 review round)
+
+@Test func movPCFromLRIsNotYetLowered() {
+    // `MOV PC, LR` is the spec-named function-return idiom (Spec §7.5's "Branch"
+    // paragraph; `Analyser.check` explicitly carves it out of E021 since it's a
+    // sanctioned write to R15). Task 15 only implements data processing — Task 16
+    // owns branches. Routing this through the ordinary `.mov` case would silently
+    // store LR's value into R15's *display slot* (`str w11, [x27, #60]`) with no
+    // `ldp`/`ret`, so execution falls through instead of returning: valid-looking
+    // assembly, silently wrong control flow. It must fail loudly (E013) until
+    // Task 16 implements the real lowering, exactly like `BX LR` already does.
+    let (assembly, bag) = lower(preamble + "\n    MOV PC, LR\n")
+    #expect(bag.hasErrors)
+    #expect(assembly == nil)
+    let diagnostic = bag.diagnostics.first { $0.code == "E013" }
+    #expect(diagnostic != nil)
+    #expect(diagnostic?.message.contains("MOV") == true)
+}
+
+@Test func loweringRefusesToEmitWhenAnOperandIsInvalidDuringLowering() {
+    // Spec §8: this is a *different* error path than `loweringRefusesToEmitWhenThereAreErrors`
+    // above (which pins an error raised during Analysis, before `lower` even runs).
+    // `ADD R1, R2, [R3]` passes the Analyser untouched — its operand-checking loop
+    // has no `.address` case — and only fails once `Lowering.materialise` reaches
+    // its `default:` arm and emits E037. An implementation that only checked
+    // `diagnostics.hasErrors` at entry (pre-existing errors) but not after lowering
+    // itself accumulates a new one would wrongly return real assembly text here.
+    let (assembly, bag) = lower(preamble + "\n    ADD R1, R2, [R3]\n")
+    #expect(bag.hasErrors)
+    #expect(assembly == nil)
+    let diagnostic = bag.diagnostics.first { $0.code == "E037" }
+    #expect(diagnostic != nil)
+}
+
+@Test func plainMovEmitsMovNotAnds() {
+    // Distinguishes unsuffixed MOV from MOVS: a regression that made plain MOV
+    // take the `ands`-based MOVS path would still "work" (N/Z would just be an
+    // unwanted side effect) but would violate Spec §7.5's row for `MOV Rd, Op2`,
+    // and no other test pins the unsuffixed form's exact text.
+    let text = lower(preamble + "\n    MOV R1, #1\n").0 ?? ""
+    #expect(text.contains("mov     w11, w10"))
+    #expect(!text.contains("ands    w11, w10, w10"))
+}
+
+@Test func nativeSSuffixRowsEmitTheCorrectSuffixedMnemonic() {
+    // Spec §7.5: ADDS is the table's first S-suffixed example; SBCS/RSBS/RSCS
+    // round out the carry-consuming/reversed-operand rows that weren't pinned
+    // anywhere else. A regression that dropped the `s` in just one arithmetic()
+    // case (e.g. `.add` while leaving `.sub` intact) would pass every other test
+    // in this file but is caught here.
+    #expect((lower(preamble + "\n    ADDS R4, R1, R2\n").0 ?? "").contains("adds    w11, w9, w10"))
+    #expect((lower(preamble + "\n    ADCS R4, R1, R2\n").0 ?? "").contains("adc     w11, w9, w10") == false)
+    #expect((lower(preamble + "\n    ADCS R4, R1, R2\n").0 ?? "").contains("adcs    w11, w9, w10"))
+    #expect((lower(preamble + "\n    SBCS R4, R1, R2\n").0 ?? "").contains("sbcs    w11, w9, w10"))
+    #expect((lower(preamble + "\n    RSBS R4, R1, R2\n").0 ?? "").contains("subs    w11, w10, w9"))
+    #expect((lower(preamble + "\n    RSCS R4, R1, R2\n").0 ?? "").contains("sbcs    w11, w10, w9"))
+}
+
+@Test func unsuffixedEorEmitsPlainEor() {
+    // `EORS`'s ands-trick shape is already pinned by
+    // `orrAndEorHaveNoFlagSettingFormAndUseTheAndsTrick`, but nothing previously
+    // asserted unsuffixed `EOR`'s own text — a regression that only fixed EORS's
+    // string but broke plain EOR's `pad("eor")` call would pass every existing test.
+    let text = lower(preamble + "\n    EOR R4, R1, R2\n").0 ?? ""
+    #expect(text.contains("eor     w11, w9, w10"))
+    #expect(!text.contains("ands    w11, w11, w11"))
+}
