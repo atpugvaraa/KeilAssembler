@@ -3299,14 +3299,14 @@ enum Lowering {
                     severity: .error, code: "E036",
                     message: "RRX is not lowered in this milestone",
                     range: range,
-                    note: "Spec §7.4 leaves the RRX sequence undefined; see Spec §12"
+                    note: "Spec §9 D1 describes the shifter-carry limitation but never defines the RRX sequence"
                 ))
                 return
             }
 
             if let amountRegister = shift.amountRegister {
                 Emitter.loadRegister(amountRegister, into: "w11", into: &builder)
-                builder.instruction("\(pad(shift.kind.variableMnemonic)) w10, w10, w11")
+                builder.instruction("\(pad(shift.kind.variableMnemonic))w10, w10, w11")
                 return
             }
 
@@ -3315,11 +3315,13 @@ enum Lowering {
                     amountExpression, symbols: symbols, here: address,
                     range: range, diagnostics: &diagnostics
                   ) else { return }
-            builder.instruction("\(pad(shift.kind.rawValue)) w10, w10, #\(amount)")
+            builder.instruction("\(pad(shift.kind.rawValue))w10, w10, #\(amount)")
         }
     }
 
-    /// Column-aligns a mnemonic so the emitted assembly stays readable.
+    /// Pads a mnemonic to 8 columns so the emitted assembly stays readable. The padding
+    /// IS the separator — call sites must not add a literal space after it, or every
+    /// instruction comes out double-spaced.
     static func pad(_ mnemonic: String) -> String {
         mnemonic.padding(toLength: max(mnemonic.count, 8), withPad: " ", startingAt: 0)
     }
@@ -3460,7 +3462,7 @@ extension Lowering {
                     Emitter.restoreFlags(into: &builder)
                     let label = "Lskip_\(skipCounter)"
                     skipCounter += 1
-                    builder.instruction("b.\(pad(inverse)) \(label)")
+                    builder.instruction("\(pad("b." + inverse))\(label)")
                     skipLabel = label
                 }
 
@@ -3590,16 +3592,16 @@ extension Lowering {
         let setsFlags = instruction.setsFlags && !needsExplicitFlagSet(instruction)
         let suffix = setsFlags ? "s" : ""
         switch instruction.mnemonic {
-        case .add: return "\(pad("add" + suffix)) w11, w9, w10"
-        case .adc: return "\(pad("adc" + suffix)) w11, w9, w10"
-        case .sub: return "\(pad("sub" + suffix)) w11, w9, w10"
-        case .sbc: return "\(pad("sbc" + suffix)) w11, w9, w10"
-        case .rsb: return "\(pad("sub" + suffix)) w11, w10, w9"
-        case .rsc: return "\(pad("sbc" + suffix)) w11, w10, w9"
-        case .and: return "\(pad("and" + suffix)) w11, w9, w10"
-        case .bic: return "\(pad("bic" + suffix)) w11, w9, w10"
-        case .orr: return "\(pad("orr")) w11, w9, w10"
-        case .eor: return "\(pad("eor")) w11, w9, w10"
+        case .add: return "\(pad("add" + suffix))w11, w9, w10"
+        case .adc: return "\(pad("adc" + suffix))w11, w9, w10"
+        case .sub: return "\(pad("sub" + suffix))w11, w9, w10"
+        case .sbc: return "\(pad("sbc" + suffix))w11, w9, w10"
+        case .rsb: return "\(pad("sub" + suffix))w11, w10, w9"
+        case .rsc: return "\(pad("sbc" + suffix))w11, w10, w9"
+        case .and: return "\(pad("and" + suffix))w11, w9, w10"
+        case .bic: return "\(pad("bic" + suffix))w11, w9, w10"
+        case .orr: return "\(pad("orr"))w11, w9, w10"
+        case .eor: return "\(pad("eor"))w11, w9, w10"
         default:   return "nop"
         }
     }
@@ -3779,7 +3781,7 @@ Replace the `default:` arm of the `switch instruction.mnemonic` with these cases
                         offset, symbols: symbols, here: address, range: range, diagnostics: &diagnostics
                     ) ?? 0
                     Emitter.materialiseImmediate(value, into: "w12", into: &builder)
-                    builder.instruction("\(pad(negated ? "sub" : "add")) w9, w9, w12")
+                    builder.instruction("\(pad(negated ? "sub" : "add"))w9, w9, w12")
                 }
                 if writeBack { Emitter.storeRegister(base, from: "w9", into: &builder) }
 
@@ -3790,9 +3792,9 @@ Replace the `default:` arm of the `switch instruction.mnemonic` with these cases
                     let amount = ExpressionEvaluator.evaluate(
                         amountExpression, symbols: symbols, here: address, range: range, diagnostics: &diagnostics
                     ) ?? 0
-                    builder.instruction("\(pad(shift.kind.rawValue)) w12, w12, #\(amount)")
+                    builder.instruction("\(pad(shift.kind.rawValue))w12, w12, #\(amount)")
                 }
-                builder.instruction("\(pad(negated ? "sub" : "add")) w9, w9, w12")
+                builder.instruction("\(pad(negated ? "sub" : "add"))w9, w9, w12")
                 if writeBack { Emitter.storeRegister(base, from: "w9", into: &builder) }
 
             case .postIndexed(let base, let offset, let negated):
@@ -3804,17 +3806,17 @@ Replace the `default:` arm of the `switch instruction.mnemonic` with these cases
                 // updated base and is written back only after the shared access
                 // below — post-indexing must not emit an access of its own.
                 Emitter.materialiseImmediate(value, into: "w12", into: &builder)
-                builder.instruction("\(pad(negated ? "sub" : "add")) w12, w9, w12")
+                builder.instruction("\(pad(negated ? "sub" : "add"))w12, w9, w12")
                 postIndexBase = base
             }
 
             if isStore {
                 Emitter.loadRegister(dataRegister, into: "w11", into: &builder)
-                builder.instruction("\(pad("str" + widthSuffix(width))) w11, [x28, w9, uxtw]")
+                builder.instruction("\(pad("str" + widthSuffix(width)))w11, [x28, w9, uxtw]")
                 if let postIndexBase { Emitter.storeRegister(postIndexBase, from: "w12", into: &builder) }
                 Emitter.trace(line: sourceLine, storeAddressRegister: "w9", storeWidth: width, into: &builder)
             } else {
-                builder.instruction("\(pad("ldr" + widthSuffix(width))) w11, [x28, w9, uxtw]")
+                builder.instruction("\(pad("ldr" + widthSuffix(width)))w11, [x28, w9, uxtw]")
                 Emitter.storeRegister(dataRegister, from: "w11", into: &builder)
                 if let postIndexBase { Emitter.storeRegister(postIndexBase, from: "w12", into: &builder) }
                 Emitter.trace(line: sourceLine, storeAddressRegister: nil, storeWidth: 0, into: &builder)
@@ -3871,7 +3873,7 @@ Replace the `default:` arm of the `switch instruction.mnemonic` with these cases
                 Emitter.storeRegister(14, from: "w11", into: &builder)
             }
             Emitter.trace(line: sourceLine, storeAddressRegister: nil, storeWidth: 0, into: &builder)
-            builder.instruction("\(pad(instruction.mnemonic == .bl ? "bl" : "b")) \(Emitter.armLabel(name))")
+            builder.instruction("\(pad(instruction.mnemonic == .bl ? "bl" : "b"))\(Emitter.armLabel(name))")
             return
 
         case .bx:
