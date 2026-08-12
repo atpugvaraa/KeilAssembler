@@ -136,11 +136,31 @@ struct Driver: Sendable {
         process.currentDirectoryURL = directory
 
         let errorPipe = Pipe()
+        let outputPipe = Pipe()
         process.standardError = errorPipe
-        process.standardOutput = Pipe()
+        process.standardOutput = outputPipe
 
         try process.run()
-        let errorData = errorPipe.fileHandleForReading.readDataToEndOfFile()
+
+        // Both pipes must be drained concurrently, not one after the other: a
+        // child that writes more than the pipe's kernel buffer (~64 KiB) to
+        // stdout blocks on write() until someone reads it. Reading only
+        // stderr here (as an earlier version did) would deadlock the moment
+        // a linked program — clang included — ever produced that much
+        // stdout, since this thread would sit in readDataToEndOfFile() on
+        // stderr while the child sat blocked writing to stdout, with neither
+        // side able to proceed to waitUntilExit().
+        let outputHandle = outputPipe.fileHandleForReading
+        let errorHandle = errorPipe.fileHandleForReading
+        let drainGroup = DispatchGroup()
+        drainGroup.enter()
+        DispatchQueue.global(qos: .utility).async {
+            _ = outputHandle.readDataToEndOfFile()
+            drainGroup.leave()
+        }
+        let errorData = errorHandle.readDataToEndOfFile()
+        drainGroup.wait()
+
         process.waitUntilExit()
 
         return (process.terminationStatus, String(data: errorData, encoding: .utf8) ?? "")
