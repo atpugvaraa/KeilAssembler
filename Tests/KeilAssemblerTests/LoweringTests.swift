@@ -649,3 +649,80 @@ MAIN
     #expect(traceCall != nil && branch != nil)
     if let traceCall, let branch { #expect(traceCall.lowerBound < branch.lowerBound) }
 }
+
+// MARK: - Task 16 review round (Critical findings)
+
+@Test func malformedBXProducesADiagnosticInsteadOfSilentlyReturning() {
+    // Critical 1: the `.bx` case performed no operand-shape check at all, unlike
+    // every other case in this file. `Analyser.check`'s E014 guard only fires for
+    // `.operand2(.register(n))` with n != 14 — any *other* shape (a bare `BX` with
+    // no operand, `BX #5`, ...) matched nothing there either, so it silently
+    // lowered to a valid `ldp`/`ret` exactly as though the source said `BX LR`.
+    // Before Task 16 these fell to `default:` -> E013; this pins that they still
+    // error now that `.bx` is a real case, just via a different guard.
+    let immediate = lower(preamble + "\n    BX #5\n")
+    #expect(immediate.1.hasErrors)
+    #expect(immediate.0 == nil)
+    #expect(immediate.1.diagnostics.map(\.code).contains("E013"))
+
+    let bare = lower(preamble + "\n    BX\n")
+    #expect(bare.1.hasErrors)
+    #expect(bare.0 == nil)
+    #expect(bare.1.diagnostics.map(\.code).contains("E013"))
+}
+
+@Test func addressModeRRXIsDiagnosedNotSilentlyDropped() {
+    // Critical 2: `registerOffset`'s shift handling was gated on
+    // `let amountExpression = shift.amount` — but RRX never carries `#k` (the
+    // parser permits exactly that), so `shift.amount` is always nil for RRX and
+    // the entire shift block, rotate included, was skipped in total silence:
+    // `STR R3, [R1, R2, RRX]` computed address = R1+R2 with the rotate dropped
+    // and emitted no diagnostic anywhere. `materialiseOperand2` one function away
+    // already gets this right (E036) — mirror it here.
+    let (assembly, bag) = lower(preamble + "\n    STR R3, [R1, R2, RRX]\n")
+    #expect(bag.hasErrors)
+    #expect(assembly == nil)
+    let diagnostic = bag.diagnostics.first { $0.code == "E036" }
+    #expect(diagnostic != nil)
+    #expect(diagnostic?.note == "Spec §7.4 leaves the RRX sequence undefined; see Spec §9 D1")
+}
+
+@Test func bxLrLowersToTheReturnSequence() {
+    // Important 4: `BX LR` had no dedicated Lowering test even though it's one of
+    // the two return-sequence idioms named in the brief — exactly where Critical 1
+    // lived. Positive companion to `malformedBXProducesADiagnosticInsteadOfSilentlyReturning`.
+    let (assembly, bag) = lower(preamble + "\n    BX LR\n")
+    #expect(bag.hasErrors == false)
+    let text = assembly ?? ""
+    #expect(text.contains("ldp     x29, x30, [sp], #16"))
+    #expect(text.contains("ret"))
+}
+
+@Test func adrMaterialisesTheLabelAddressNotItsContents() {
+    // Important 4: `ADR` had no dedicated Lowering test. Spec §7.6: `ADR Rd, label`
+    // is the label's *address*; `LDR Rd, label` is its *contents* — a regression
+    // that collapsed ADR onto the LDR-label path would still assemble (valid A64)
+    // but silently read through memory instead of just materialising the address.
+    let text = lower("""
+        AREA PROGRAM, CODE, READONLY
+        ENTRY
+    MAIN
+        ADR R1, VALUE
+        AREA STORAGE, DATA, READONLY
+    VALUE DCD &3000F000
+    """).0 ?? ""
+    #expect(text.contains("str     w11, [x27, #4]"))   // R1
+    #expect(!text.contains("[x28,"))                    // no memory access at all
+}
+
+@Test func stmfdWithExplicitStackPointerWritebackParses() {
+    // Important 3: `STMFD SP!, {reglist}` is the spec-legal spelling (§6.3), but
+    // `parseOperand` only consumed a `!` writeback marker inside `[...]` — a bare
+    // `SP!` outside brackets fell through to the missing-comma check and produced
+    // E040, never reaching Lowering at all. STMFD/LDMFD's lowering already
+    // hardcodes R13 as the base, so the parsed base register is informational —
+    // but the spelling itself must parse and reach Lowering.
+    let text = lower(preamble + "\n    STMFD SP!, {R1, R4}\n").0 ?? ""
+    #expect(text.contains("ldr     w9, [x27, #52]"))    // R13
+    #expect(text.contains("str     w11, [x28, w9, uxtw]"))
+}

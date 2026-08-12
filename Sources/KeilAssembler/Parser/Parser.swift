@@ -476,6 +476,12 @@ struct Parser {
                 return .operand2(operand2)
             }
             advance()
+            // `Rn!` outside `[...]` — e.g. `STMFD SP!, {R1, R4}` (Spec §6.3), the
+            // only spec-legal spelling of the writeback form. The base register
+            // carries no further meaning to Lowering (STMFD/LDMFD hardcode R13 as
+            // SP regardless of what's written here), so the `!` is simply consumed
+            // rather than left to trip the missing-comma check (E040) below.
+            _ = match(.bang)
             return .register(number)
         }
 

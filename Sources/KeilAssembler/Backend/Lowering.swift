@@ -295,11 +295,27 @@ extension Lowering {
             case .registerOffset(let base, let offsetRegister, let negated, let shift, let writeBack):
                 Emitter.loadRegister(base, into: "w9", into: &builder)
                 Emitter.loadRegister(offsetRegister, into: "w12", into: &builder)
-                if let shift, let amountExpression = shift.amount, shift.kind != .rrx {
-                    let amount = ExpressionEvaluator.evaluate(
-                        amountExpression, symbols: symbols, here: address, range: range, diagnostics: &diagnostics
-                    ) ?? 0
-                    builder.instruction("\(pad(shift.kind.rawValue))w12, w12, #\(amount)")
+                if let shift {
+                    // RRX never carries `#k` — the parser permits exactly that — so
+                    // gating on `shift.amount` alone (as an earlier version of this
+                    // case did) let RRX skip the entire shift block, rotate
+                    // included, in total silence. Diagnose it explicitly instead,
+                    // mirroring `materialiseOperand2`'s identical E036.
+                    if shift.kind == .rrx {
+                        diagnostics.emit(Diagnostic(
+                            severity: .error, code: "E036",
+                            message: "RRX is not lowered in this milestone",
+                            range: range,
+                            note: "Spec §7.4 leaves the RRX sequence undefined; see Spec §9 D1"
+                        ))
+                        return
+                    }
+                    if let amountExpression = shift.amount {
+                        let amount = ExpressionEvaluator.evaluate(
+                            amountExpression, symbols: symbols, here: address, range: range, diagnostics: &diagnostics
+                        ) ?? 0
+                        builder.instruction("\(pad(shift.kind.rawValue))w12, w12, #\(amount)")
+                    }
                 }
                 builder.instruction("\(pad(negated ? "sub" : "add"))w9, w9, w12")
                 if writeBack { Emitter.storeRegister(base, from: "w9", into: &builder) }
@@ -394,6 +410,16 @@ extension Lowering {
             return
 
         case .bx:
+            // `Analyser.check`'s E014 guard only rejects `.operand2(.register(n))`
+            // with n != 14 — a different operand shape entirely (a bare `BX` with
+            // no operand, `BX #5`, ...) matches nothing there, so it reaches here
+            // with no prior diagnostic. Every other case in this switch guards its
+            // own operand shape before emitting; `.bx` must too, or those forms
+            // silently lower to a valid `ldp`/`ret` as though the source said
+            // `BX LR`.
+            guard case .operand2(.register(14))? = instruction.operands.first else {
+                unsupported(instruction, into: &diagnostics); return
+            }
             Emitter.trace(line: sourceLine, storeAddressRegister: nil, storeWidth: 0, into: &builder)
             builder.instruction("ldp     x29, x30, [sp], #16")
             builder.instruction("ret")
