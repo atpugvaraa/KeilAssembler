@@ -245,3 +245,100 @@ END
     #expect(result.snapshots.map(\.pc) == [origin, origin + 4, origin + 8])
     #expect(result.snapshots.map { $0.registers[15] } == [origin, origin + 4, origin + 8])
 }
+
+// MARK: - Re-review residual fixes
+
+@Test func r2AdcProducesTheRightValueWithCarryClear() throws {
+    // R2: `restoreFlags` clobbers w9 (holding Rn) before `adc` reads it back, so
+    // ADC silently computes Rn's *destination* from the CPSR word instead of Rn.
+    // ADDS here leaves C clear (5 + 1 does not overflow 32 bits), so ADC's carry
+    // input is 0: R9 should end up R1 + R0 + 0 = 5.
+    let result = try Driver().run(source: """
+        AREA PROGRAM, CODE, READONLY
+        ENTRY
+
+    MAIN
+    MOV R1, #5
+    ADDS R8, R1, #1
+    ADC R9, R1, #0
+    END
+    """, preload: MemoryPreload())
+    #expect(result.exitCode == 0)
+    #expect(result.finalRegisters[8] == 6)
+    #expect(result.finalRegisters[9] == 5)
+}
+
+@Test func r2AdcProducesTheRightValueWithCarrySet() throws {
+    // Same shape, but the preceding ADDS overflows 32 bits (0xFF000000 + 0xFF000000
+    // — 0xFF000000 is an ARM7-encodable modified immediate, an 8-bit value rotated
+    // right by 8) and leaves C set, so ADC's carry input is 1: R9 should end up
+    // R1 + R0 + 1 = 6.
+    let result = try Driver().run(source: """
+        AREA PROGRAM, CODE, READONLY
+        ENTRY
+
+    MAIN
+    MOV R1, #5
+    MOV R2, #0XFF000000
+    ADDS R8, R2, R2
+    ADC R9, R1, #0
+    END
+    """, preload: MemoryPreload())
+    #expect(result.exitCode == 0)
+    #expect(result.finalRegisters[9] == 6)
+}
+
+@Test func r2SbcProducesTheRightValueAcrossBothCarryStates() throws {
+    // R2: SBC reads NOT(borrow) from C, same clobber risk as ADC. `SUBS R8, R2,
+    // R2` (0 - 0) leaves C set (no borrow — A64/ARM7 carry is inverted borrow for
+    // subtraction), so `SBC R9, R1, #0` should compute R1 - 0 - 0 = R1.
+    let noBorrow = try Driver().run(source: """
+        AREA PROGRAM, CODE, READONLY
+        ENTRY
+
+    MAIN
+    MOV R1, #9
+    MOV R2, #3
+    SUBS R8, R2, R2
+    SBC R9, R1, #0
+    END
+    """, preload: MemoryPreload())
+    #expect(noBorrow.exitCode == 0)
+    #expect(noBorrow.finalRegisters[9] == 9)
+
+    // `SUBS R8, R2, R1` with R2 < R1 (3 - 9) borrows, clearing C, so
+    // `SBC R9, R1, #0` should compute R1 - 0 - 1 = R1 - 1.
+    let borrow = try Driver().run(source: """
+        AREA PROGRAM, CODE, READONLY
+        ENTRY
+
+    MAIN
+    MOV R1, #9
+    MOV R2, #3
+    SUBS R8, R2, R1
+    SBC R9, R1, #0
+    END
+    """, preload: MemoryPreload())
+    #expect(borrow.exitCode == 0)
+    #expect(borrow.finalRegisters[9] == 8)
+}
+
+@Test func r2RscReversesItsOperandsAndReadsCarryCorrectly() throws {
+    // R2: RSC is the most likely to hide a second bug on top of the clobber,
+    // since it also reverses its operands (Op2 - Rn, not Rn - Op2). With C set
+    // (no borrow) via `SUBS R8, R2, R2`, `RSC R9, R1, #20` should compute
+    // 20 - R1 - 0 = 20 - 9 = 11.
+    let result = try Driver().run(source: """
+        AREA PROGRAM, CODE, READONLY
+        ENTRY
+
+    MAIN
+    MOV R1, #9
+    MOV R2, #3
+    SUBS R8, R2, R2
+    RSC R9, R1, #20
+    END
+    """, preload: MemoryPreload())
+    #expect(result.exitCode == 0)
+    #expect(result.finalRegisters[9] == 11)
+}

@@ -266,9 +266,12 @@ MAIN
     #expect(!rsb.contains("sub     w11, w9, w10"))
 
     // RSC also restores C before operating (it reads carry), on top of the reversal.
+    // R2 (re-review): the restore is routed through w12, not w9 — w9 already holds
+    // Rn by this point, and reloading the CPSR word into it would clobber Rn before
+    // the `sbc` below reads it back.
     let rsc = lower(preamble + "\n    RSC R4, R1, R2\n").0 ?? ""
-    #expect(rsc.contains("ldr     w9, [x27, #64]"))
-    #expect(rsc.contains("msr     nzcv, x9"))
+    #expect(rsc.contains("ldr     w12, [x27, #64]"))
+    #expect(rsc.contains("msr     nzcv, x12"))
     #expect(rsc.contains("sbc     w11, w10, w9"))
 }
 
@@ -277,20 +280,51 @@ MAIN
     // wrong implementation that treated ADC like ADD (skipping the restore) would
     // still produce plausible-looking `adc` text but read whatever PSTATE.C happens
     // to hold after the preceding `bl _armd_trace` — garbage, not ARM7's C.
+    //
+    // R2 (re-review): the restore must not go through w9 — w9 already holds `Rn`
+    // at this point, and `restoreFlags`'s default scratch clobbers it before the
+    // `adc`/`sbc` below reads w9 back. It goes through w12 instead.
     let adc = lower(preamble + "\n    ADC R4, R1, R2\n").0 ?? ""
-    #expect(adc.contains("ldr     w9, [x27, #64]"))
-    #expect(adc.contains("msr     nzcv, x9"))
+    #expect(adc.contains("ldr     w12, [x27, #64]"))
+    #expect(adc.contains("msr     nzcv, x12"))
     #expect(adc.contains("adc     w11, w9, w10"))
 
     let sbc = lower(preamble + "\n    SBC R4, R1, R2\n").0 ?? ""
-    #expect(sbc.contains("ldr     w9, [x27, #64]"))
-    #expect(sbc.contains("msr     nzcv, x9"))
+    #expect(sbc.contains("ldr     w12, [x27, #64]"))
+    #expect(sbc.contains("msr     nzcv, x12"))
     #expect(sbc.contains("sbc     w11, w9, w10"))
 
     // ADD does NOT restore flags first — it doesn't read carry. Pinning the absence
     // catches an implementation that restored flags unconditionally for every mnemonic.
     let add = lower(preamble + "\n    ADD R4, R1, R2\n").0 ?? ""
     #expect(!add.contains("msr     nzcv"))
+}
+
+@Test func carryConsumingInstructionsDoNotReclobberRnWhileRestoringFlags() {
+    // R2 (re-review, CRITICAL): `restoreFlags` reloads the CPSR word into w9 —
+    // the very register `Rn` was just loaded into a few lines above, for ADC/SBC/
+    // RSC. `carryConsumingInstructionsRestoreFlagsBeforeOperating` above only
+    // checks that each fragment of text is *present somewhere*, so it can't catch
+    // this: it passes even though the CPSR reload sits physically between the Rn
+    // load and the `adc`/`sbc` that reads w9 back, overwriting Rn with the CPSR
+    // word first. This test pins order: no `w9` reload may appear between the Rn
+    // load and the arithmetic instruction that consumes it.
+    for source in ["ADC R4, R1, R2", "SBC R4, R1, R2", "RSC R4, R1, R2"] {
+        let text = lower(preamble + "\n    \(source)\n").0 ?? ""
+        guard let rnLoadRange = text.range(of: "ldr     w9, [x27, #4]") else {
+            Issue.record("\(source): Rn (R1) load into w9 not found")
+            continue
+        }
+        guard let opRange = text.range(
+            of: source.hasPrefix("RSC") ? "sbc     w11, w10, w9" : "\(source.hasPrefix("ADC") ? "adc" : "sbc")     w11, w9, w10"
+        ) else {
+            Issue.record("\(source): arithmetic instruction reading w9/w10 not found")
+            continue
+        }
+        #expect(rnLoadRange.upperBound < opRange.lowerBound, "\(source): Rn load must precede the arithmetic op")
+        let between = text[rnLoadRange.upperBound..<opRange.lowerBound]
+        #expect(!between.contains("w9, [x27, #64]"), "\(source): CPSR restore must not reload into w9 between the Rn load and the op — found: \(between)")
+    }
 }
 
 @Test func andAndBicUseTheirOwnNativeFlagSettingForms() {

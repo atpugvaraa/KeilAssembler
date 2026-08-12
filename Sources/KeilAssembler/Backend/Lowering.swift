@@ -216,7 +216,12 @@ extension Lowering {
             }
             Emitter.loadRegister(first, into: "w9", into: &builder)
             materialise(second, symbols: symbols, address: address, range: range, into: &builder, diagnostics: &diagnostics)
-            if carryConsuming.contains(instruction.mnemonic) { Emitter.restoreFlags(into: &builder) }
+            // R2 (re-review, CRITICAL): `restoreFlags`'s default scratch (w9) is
+            // exactly the register `Rn` was just loaded into above — using it here
+            // would overwrite Rn with the CPSR word before `arithmetic(instruction)`
+            // reads w9 back. w12 is free at this point (Op2 materialisation only
+            // ever touches w10/w11), so route the CPSR round-trip through it instead.
+            if carryConsuming.contains(instruction.mnemonic) { Emitter.restoreFlags(scratch: "w12", into: &builder) }
             builder.instruction(arithmetic(instruction))
             if needsExplicitFlagSet(instruction) { builder.instruction("ands    w11, w11, w11") }
             Emitter.storeRegister(destination, from: "w11", into: &builder)

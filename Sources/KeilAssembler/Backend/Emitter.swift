@@ -46,9 +46,14 @@ enum Emitter {
         builder.instruction("str     w9, [x27, #\(cpsrOffset)]")
     }
 
-    static func restoreFlags(into builder: inout AssemblyBuilder) {
-        builder.instruction("ldr     w9, [x27, #\(cpsrOffset)]")
-        builder.instruction("msr     nzcv, x9")
+    /// `scratch` is a 32-bit host register name (`"w9"`, `"w12"`, ...); its 64-bit
+    /// alias is derived for the `msr` (PSTATE's NZCV bits are addressed via the
+    /// containing 64-bit register). Defaults to `w9`, the original scratch, so
+    /// every call site but the one that needs otherwise (Spec §7.5's ADC/SBC/RSC,
+    /// which already holds `Rn` in w9 when this runs) is unaffected.
+    static func restoreFlags(scratch: String = "w9", into builder: inout AssemblyBuilder) {
+        builder.instruction("ldr     \(scratch), [x27, #\(cpsrOffset)]")
+        builder.instruction("msr     nzcv, x\(scratch.dropFirst())")
     }
 
     // MARK: - Trace (Spec §7.7)
