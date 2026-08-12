@@ -3505,6 +3505,14 @@ extension Lowering {
                   let source = instruction.operands.dropFirst().first else {
                 unsupported(instruction, into: &diagnostics); return
             }
+            // `MOV PC, LR` is the return idiom Spec §7.5 lowers in Task 16. Until then
+            // it must error, not fall through to a plain register move: that writes
+            // R15's display slot and emits no `ret`, so control flow silently falls
+            // through. `BX LR` defers the same way.
+            if instruction.mnemonic == .mov, !instruction.setsFlags, destination == 15,
+               source == .operand2(.register(14)) || source == .register(14) {
+                unsupported(instruction, into: &diagnostics); return
+            }
             materialise(source, symbols: symbols, address: address, range: range, into: &builder, diagnostics: &diagnostics)
             if instruction.mnemonic == .mvn {
                 builder.instruction("mvn     w11, w10")
@@ -3549,14 +3557,18 @@ extension Lowering {
             Emitter.saveFlags(into: &builder)
 
         case .mul, .mla:
-            guard case .register(let destination)? = instruction.operands.first,
-                  case .register(let multiplicand)? = instruction.operands.dropFirst().first,
-                  case .register(let multiplier)? = instruction.operands.dropFirst(2).first else {
+            // The parser wraps a line-final register as `.operand2(.register(_))`, so
+            // `Rs` in MUL and `Rn` in MLA never arrive as a bare `.register`. Matching
+            // only the bare form made every MUL raise a spurious E013 and made MLA drop
+            // its accumulator silently. `registerOperand` accepts both spellings.
+            guard let destination = registerOperand(instruction.operands.first),
+                  let multiplicand = registerOperand(instruction.operands.dropFirst().first),
+                  let multiplier = registerOperand(instruction.operands.dropFirst(2).first) else {
                 unsupported(instruction, into: &diagnostics); return
             }
             Emitter.loadRegister(multiplicand, into: "w9", into: &builder)
             Emitter.loadRegister(multiplier, into: "w10", into: &builder)
-            if instruction.mnemonic == .mla, case .register(let addend)? = instruction.operands.dropFirst(3).first {
+            if instruction.mnemonic == .mla, let addend = registerOperand(instruction.operands.dropFirst(3).first) {
                 Emitter.loadRegister(addend, into: "w12", into: &builder)
                 builder.instruction("madd    w11, w9, w10, w12")
             } else {
@@ -3627,6 +3639,16 @@ extension Lowering {
                 message: "operand is not valid here",
                 range: range, note: nil
             ))
+        }
+    }
+
+    /// Accepts either spelling of a register operand. A line-final register arrives as
+    /// `.operand2(.register(_))`; anywhere else it is a bare `.register(_)`.
+    static func registerOperand(_ operand: Operand?) -> Int? {
+        switch operand {
+        case .register(let number): number
+        case .operand2(.register(let number)): number
+        default: nil
         }
     }
 
