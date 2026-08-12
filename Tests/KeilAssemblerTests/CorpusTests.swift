@@ -323,6 +323,95 @@ END
     #expect(borrow.finalRegisters[9] == 8)
 }
 
+@Test func r1TopLevelReturnAfterASubroutineDoesNotCorruptTheFrame() throws {
+    // R1: the previous wave's "inside a call target" latch is monotonic — once any
+    // call-target label (HELPER) is seen, every later return, including FINISH's
+    // top-level one, is treated as though it has a frame to pop. FINISH never had
+    // one pushed, so its `BX LR` pops the host prologue's own saved x27/x28 pair
+    // and returns through garbage. Exact re-review repro.
+    let result = try Driver().run(source: """
+        AREA PROGRAM, CODE, READONLY
+        ENTRY
+
+    MAIN
+    MOV R4, #7
+    BL HELPER
+    B FINISH
+    HELPER
+    MOV R6, #2
+    BX LR
+    FINISH
+    MOV R2, #9
+    BX LR
+    END
+    """, preload: MemoryPreload())
+    #expect(result.exitCode == 0)
+    #expect(result.finalRegisters[4] == 7)
+    #expect(result.finalRegisters[6] == 2)
+    #expect(result.finalRegisters[2] == 9)
+}
+
+@Test func r1SubroutineDefinedBeforeItsCallerStillWorks() throws {
+    // R1: the same latch bug, from the other direction — HELPER's call-target
+    // label is seen *before* MAIN's, so by the time MAIN's own top-level `BX LR`
+    // runs, the latch has already gone true and stays true. Nothing in the
+    // previous wave's premise ("call targets are always written after their
+    // callers") holds here.
+    // ENTRY still marks MAIN (not HELPER) as the actual entry point — that's how
+    // Keil ARMASM's ENTRY directive works, and moving it would test something
+    // else entirely. What's unusual here is only that HELPER's *definition*
+    // precedes MAIN's in the source, lexically ahead of the entry label.
+    let result = try Driver().run(source: """
+        AREA PROGRAM, CODE, READONLY
+
+    HELPER
+    MOV R6, #2
+    BX LR
+    ENTRY
+    MAIN
+    MOV R4, #7
+    BL HELPER
+    MOV R2, #9
+    BX LR
+    END
+    """, preload: MemoryPreload())
+    #expect(result.exitCode == 0)
+    #expect(result.finalRegisters[4] == 7)
+    #expect(result.finalRegisters[6] == 2)
+    #expect(result.finalRegisters[2] == 9)
+}
+
+@Test func r1NestedSubroutinesEachReturnCorrectly() throws {
+    // R1: MAIN calls SUBA, SUBA calls SUBB, each with its own frame and return —
+    // confirms the fix handles more than one call-target region in a single
+    // program, not just a single HELPER.
+    let result = try Driver().run(source: """
+        AREA PROGRAM, CODE, READONLY
+        ENTRY
+
+    MAIN
+    MOV R1, #1
+    BL SUBA
+    MOV R2, #2
+    BX LR
+    SUBA
+    MOV R3, #3
+    BL SUBB
+    MOV R4, #4
+    BX LR
+    SUBB
+    MOV R5, #5
+    BX LR
+    END
+    """, preload: MemoryPreload())
+    #expect(result.exitCode == 0)
+    #expect(result.finalRegisters[1] == 1)
+    #expect(result.finalRegisters[2] == 2)
+    #expect(result.finalRegisters[3] == 3)
+    #expect(result.finalRegisters[4] == 4)
+    #expect(result.finalRegisters[5] == 5)
+}
+
 @Test func r2RscReversesItsOperandsAndReadsCarryCorrectly() throws {
     // R2: RSC is the most likely to hide a second bug on top of the clobber,
     // since it also reverses its operands (Op2 - Rn, not Rn - Op2). With C set

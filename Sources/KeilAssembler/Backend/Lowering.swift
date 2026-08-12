@@ -86,19 +86,41 @@ extension Lowering {
                 return name
             })
 
+            // R1 (re-review): a label that a top-level, unconditional `B` (not `BL`,
+            // not a conditional branch — those are either loop back-edges internal to
+            // a callee or the skip-guard machinery, neither of which leaves a frame's
+            // region) jumps to is where control returns to a no-frame context, the
+            // same way the entry label below is. `B FINISH` after a `BL HELPER` is
+            // the idiom this exists for.
+            let topLevelBranchTargets: Set<String> = Set(analysed.program.lines.compactMap { line in
+                guard case .instruction(let instruction)? = line.statement,
+                      instruction.mnemonic == .b,
+                      instruction.condition == .al,
+                      case .labelReference(let name)? = instruction.operands.first else { return nil }
+                return name
+            })
+
             // Spec §7.5: a return sequence (`BX LR` / `MOV PC, LR` / `POP {..., PC}`)
             // only has a frame to pop once execution has passed a call-target label —
-            // the `stp` those labels open above. Outside one (MAIN's own top-level
-            // `BX LR`, the natural way to end a program with no subroutines), there
-            // is nothing to pop: doing so anyway pops the host prologue's own saved
-            // x27/x28 and x29/x30 pairs and returns through garbage. This program's
-            // structure is flat — call targets are written after the code that calls
-            // them and never interleaved back into top-level flow — so a simple
-            // latch that goes true on the first call-target label and never resets
-            // is exactly right for every program this subset can express; it is not
-            // reset on a return because a callee may contain more than one (e.g. a
-            // conditional early return followed by a later unconditional one), and
-            // both need the same "inside a call target" treatment.
+            // the `stp` those labels open above — and has not since passed a label
+            // that marks a return to a no-frame context. The previous wave's premise
+            // that call targets are always written after their callers and never
+            // interleaved back into top-level flow is false (a callee can be written
+            // before its caller; a caller can resume at a label after its callee, as
+            // `B FINISH` does), so the latch can't just go true once and stay there —
+            // it has to be re-derived at every label:
+            //   - a call-target label opens a fresh frame: latch = true.
+            //   - a label the entry point lands on, or that a top-level unconditional
+            //     `B` targets, is a genuine return to no-frame top-level code: latch
+            //     = false.
+            //   - any other label (a callee's own internal loop head, reached only via
+            //     a conditional back-edge or fall-through, never via a top-level jump)
+            //     leaves the latch as it was — still inside whichever frame, if any,
+            //     was last opened.
+            // It is not reset on a *return instruction* itself, because a callee may
+            // contain more than one (e.g. a conditional early return followed by a
+            // later unconditional one), and both need the same "inside a call target"
+            // treatment for as long as the latch's label-derived state says so.
             var insideCallTargetFrame = false
 
             for (index, line) in analysed.program.lines.enumerated() {
@@ -107,6 +129,8 @@ extension Lowering {
                     if callTargets.contains(label) {
                         builder.instruction("stp     x29, x30, [sp, #-16]!")
                         insideCallTargetFrame = true
+                    } else if topLevelBranchTargets.contains(label) {
+                        insideCallTargetFrame = false
                     }
                 }
 
@@ -115,6 +139,11 @@ extension Lowering {
                 if !entryEmitted, let entryIndex = analysed.entryLineIndex, index > entryIndex {
                     builder.label(entryLabel)
                     entryEmitted = true
+                    // The entry point is where the program's real, dynamic execution
+                    // begins — with no frame on the stack, whatever the latch drifted
+                    // to while lexically scanning past any call-target labels written
+                    // earlier in the file (a callee defined before its caller).
+                    insideCallTargetFrame = false
                 }
 
                 let address = analysed.addresses[index] ?? Analyser.origin
