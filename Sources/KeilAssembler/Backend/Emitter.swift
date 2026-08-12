@@ -19,12 +19,23 @@ enum Emitter {
 
     /// movz/movk unconditionally: always two instructions, always correct.
     /// ARM7-side legality is a separate diagnostic, enforced in Task 11.
-    static func materialiseImmediate(_ value: UInt32, into hostRegister: String, into builder: inout AssemblyBuilder) {
+    ///
+    /// `radix` only changes the emitted text (`#0x7` vs. `#7`) — `as` assembles both
+    /// identically — so this is purely a readability choice per call site, not a
+    /// behavioural one. Operand2 immediates (Spec §7.4) are hex; trace's line/width
+    /// metadata (Spec §7.7) is decimal.
+    static func materialiseImmediate(
+        _ value: UInt32,
+        into hostRegister: String,
+        radix: Int = 16,
+        into builder: inout AssemblyBuilder
+    ) {
         let low = value & 0xFFFF
         let high = value >> 16
-        builder.instruction("movz    \(hostRegister), #0x\(String(low, radix: 16))")
+        let prefix = radix == 16 ? "0x" : ""
+        builder.instruction("movz    \(hostRegister), #\(prefix)\(String(low, radix: radix))")
         if high != 0 {
-            builder.instruction("movk    \(hostRegister), #0x\(String(high, radix: 16)), lsl #16")
+            builder.instruction("movk    \(hostRegister), #\(prefix)\(String(high, radix: radix)), lsl #16")
         }
     }
 
@@ -54,10 +65,10 @@ enum Emitter {
         storeWidth: Int,
         into builder: inout AssemblyBuilder
     ) {
-        materialiseDecimalImmediate(UInt32(line), into: "w0", into: &builder)
+        materialiseImmediate(UInt32(line), into: "w0", radix: 10, into: &builder)
         if let storeAddressRegister {
             builder.instruction("mov     w1, \(storeAddressRegister)")
-            materialiseDecimalImmediate(UInt32(storeWidth), into: "w2", into: &builder)
+            materialiseImmediate(UInt32(storeWidth), into: "w2", radix: 10, into: &builder)
         } else {
             builder.instruction("mov     w1, wzr")
             builder.instruction("mov     w2, wzr")
@@ -65,21 +76,13 @@ enum Emitter {
         builder.instruction("bl      _armd_trace")
     }
 
-    private static func materialiseDecimalImmediate(
-        _ value: UInt32,
-        into hostRegister: String,
-        into builder: inout AssemblyBuilder
-    ) {
-        let low = value & 0xFFFF
-        let high = value >> 16
-        builder.instruction("movz    \(hostRegister), #\(low)")
-        if high != 0 {
-            builder.instruction("movk    \(hostRegister), #\(high), lsl #16")
-        }
-    }
-
     // MARK: - Program frame (Spec §7.9)
 
+    /// `entryLabel` is required: the prologue ends with `b <entryLabel>` (the `ENTRY`
+    /// directive's target), which it has no other way to know. The brief's own
+    /// Interfaces summary lists this as `prologue(into:)` — that signature cannot
+    /// satisfy Spec §7.9, since it has no source for the branch target; the
+    /// `entryLabel:` parameter below is the one Tasks 14-16 should call.
     static func prologue(entryLabel: String, into builder: inout AssemblyBuilder) {
         builder.directive(".section __TEXT,__text")
         builder.directive(".globl _main")

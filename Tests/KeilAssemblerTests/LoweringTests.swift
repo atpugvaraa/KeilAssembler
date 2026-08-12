@@ -27,6 +27,46 @@ import Testing
     #expect(builder.text.contains("movk    w10, #0x3000, lsl #16"))
 }
 
+@Test func immediatesSkipMovkWhenTheHighHalfIsZero() {
+    // movz zeroes the rest of the register, so a zero high half needs no movk —
+    // this is the one-instruction path Tasks 14-16 rely on for every small #imm.
+    var builder = AssemblyBuilder()
+    Emitter.materialiseImmediate(7, into: "w0", into: &builder)
+    #expect(builder.text == "        movz    w0, #0x7\n")
+    #expect(!builder.text.contains("movk"))
+}
+
+@Test func frameEmitsThePrologueAndEpilogueInMirroredOrder() {
+    // Spec §7.9: a mismatched stp/ldp pairing corrupts the host stack and would
+    // only surface when a program actually runs, tasks later. Pin the exact text,
+    // including that the epilogue's ldp order is the reverse of the prologue's stp order.
+    var builder = AssemblyBuilder()
+    Emitter.prologue(entryLabel: "Lentry", into: &builder)
+    Emitter.epilogue(into: &builder)
+    let expected = [
+        "        .section __TEXT,__text",
+        "        .globl _main",
+        "        .p2align 2",
+        "_main:",
+        "        stp     x29, x30, [sp, #-16]!",
+        "        stp     x27, x28, [sp, #-16]!",
+        "        bl      _armd_init",
+        "        mov     x28, x0",
+        "        adrp    x27, _armd_state@PAGE",
+        "        add     x27, x27, _armd_state@PAGEOFF",
+        "        b       Lentry",
+        "",
+        "",
+        "Larmd_exit:",
+        "        bl      _armd_fini",
+        "        mov     w0, #0",
+        "        ldp     x27, x28, [sp], #16",
+        "        ldp     x29, x30, [sp], #16",
+        "        ret",
+    ].map { $0 + "\n" }.joined()
+    #expect(builder.text == expected)
+}
+
 @Test func flagsRoundTripThroughTheCPSRSlot() {
     // Spec §7.3: bl to a runtime helper clobbers PSTATE, so CPSR is the source of truth.
     var builder = AssemblyBuilder()
