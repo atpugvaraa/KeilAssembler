@@ -444,21 +444,22 @@ MAIN
 
 // MARK: - Review fixes (Task 15 review round)
 
-@Test func movPCFromLRIsNotYetLowered() {
+@Test func movPCFromLRLowersToTheReturnSequence() {
     // `MOV PC, LR` is the spec-named function-return idiom (Spec §7.5's "Branch"
     // paragraph; `Analyser.check` explicitly carves it out of E021 since it's a
-    // sanctioned write to R15). Task 15 only implements data processing — Task 16
-    // owns branches. Routing this through the ordinary `.mov` case would silently
-    // store LR's value into R15's *display slot* (`str w11, [x27, #60]`) with no
-    // `ldp`/`ret`, so execution falls through instead of returning: valid-looking
-    // assembly, silently wrong control flow. It must fail loudly (E013) until
-    // Task 16 implements the real lowering, exactly like `BX LR` already does.
+    // sanctioned write to R15). Task 15 deferred it (E013) because routing it
+    // through the ordinary `.mov` case would silently store LR's value into R15's
+    // *display slot* instead of returning. Task 16 implements the real lowering:
+    // identical to `BX LR` (Spec §7.5) — pop the frame, then `ret` — not a plain
+    // register move and not an error anymore.
     let (assembly, bag) = lower(preamble + "\n    MOV PC, LR\n")
-    #expect(bag.hasErrors)
-    #expect(assembly == nil)
-    let diagnostic = bag.diagnostics.first { $0.code == "E013" }
-    #expect(diagnostic != nil)
-    #expect(diagnostic?.message.contains("MOV") == true)
+    #expect(bag.hasErrors == false)
+    let text = assembly ?? ""
+    #expect(text.contains("ldp     x29, x30, [sp], #16"))
+    #expect(text.contains("ret"))
+    // It must not fall through to the ordinary MOV path (which would store into
+    // R15's display slot at offset 60 instead of returning).
+    #expect(!text.contains("str     w11, [x27, #60]"))
 }
 
 @Test func loweringRefusesToEmitWhenAnOperandIsInvalidDuringLowering() {
@@ -508,4 +509,143 @@ MAIN
     let text = lower(preamble + "\n    EOR R4, R1, R2\n").0 ?? ""
     #expect(text.contains("eor     w11, w9, w10"))
     #expect(!text.contains("ands    w11, w11, w11"))
+}
+
+// MARK: - Memory and branch lowering (Task 16)
+
+@Test func indirectLoadGoesThroughTheMemoryBase() {
+    // Spec §7.5: ldr w11, [x28, w9, uxtw]
+    let text = lower(preamble + "\n    LDR R3, [R1]\n").0 ?? ""
+    #expect(text.contains("ldr     w9, [x27, #4]"))
+    #expect(text.contains("ldr     w11, [x28, w9, uxtw]"))
+    #expect(text.contains("str     w11, [x27, #12]"))
+}
+
+@Test func literalLoadReadsTheWordAtTheLabel() {
+    // Spec §7.6: LDR Rd, label loads the *contents* of the label.
+    let text = lower("""
+        AREA PROGRAM, CODE, READONLY
+        ENTRY
+    MAIN
+        LDR R1, VALUE
+        AREA STORAGE, DATA, READONLY
+    VALUE DCD &3000F000
+    """).0 ?? ""
+    #expect(text.contains("[x28, w9, uxtw]"))
+}
+
+@Test func ldrEqualsMaterialisesTheValueWithNoMemoryAccess() {
+    // Spec §7.6: LDR Rd, =expr is a pseudo-instruction.
+    let text = lower(preamble + "\n    LDR R1, =0x3000F000\n").0 ?? ""
+    #expect(text.contains("movz    w11, #0xf000"))
+    #expect(text.contains("movk    w11, #0x3000, lsl #16"))
+    #expect(text.contains("[x28,") == false)
+}
+
+@Test func storesPassTheirEffectiveAddressToTheTrace() {
+    // Spec §7.7 as corrected: the address comes from w9, not an immediate.
+    let text = lower(preamble + "\n    STR R3, [R1]\n").0 ?? ""
+    #expect(text.contains("str     w11, [x28, w9, uxtw]"))
+    #expect(text.contains("mov     w1, w9"))
+    #expect(text.contains("movz    w2, #4"))
+}
+
+@Test func postIndexedAccessHappensExactlyOnceThenWritesBack() {
+    let text = lower(preamble + "\n    LDR R3, [R1], #4\n").0 ?? ""
+    // One access, not two: the address mode computes, the shared block accesses.
+    #expect(text.components(separatedBy: "[x28, w9, uxtw]").count - 1 == 1)
+    #expect(text.contains("add     w12, w9, w12"))
+    #expect(text.contains("str     w12, [x27, #4]"))     // R1 written back
+}
+
+@Test func pushAndPopMoveTheARM7StackPointer() {
+    let text = lower(preamble + "\n    PUSH {R1, R4}\n").0 ?? ""
+    #expect(text.contains("ldr     w9, [x27, #52]"))   // R13
+    #expect(text.contains("str     w11, [x28, w9, uxtw]"))
+    #expect(text.contains("str     w9, [x27, #52]"))
+}
+
+// The brief's own PUSH/POP tests above only exercise PUSH. An off-by-one in the
+// slot offsets, or a POP that adjusts SP before rather than after reading, would
+// corrupt the stack silently — with no test failure until Task 18 runs a program.
+// Round-trip PUSH then POP on the same register list and pin that POP reads slot 0
+// (the lowest register) straight through w9, exactly where PUSH wrote it, and that
+// SP is restored only after every register has been read back.
+
+@Test func popMirrorsPushWithLowestRegisterAtTheLowestAddress() {
+    let text = lower(preamble + "\n    PUSH {R1, R4}\n    POP {R1, R4}\n").0 ?? ""
+    // POP's slot-0 read (R1, the lowest register) goes straight through w9, just
+    // like PUSH's slot-0 write did — no offset arithmetic needed for either.
+    let popSlot0 = text.range(of: "ldr     w11, [x28, w9, uxtw]")
+    let popStoreR1 = text.range(of: "str     w11, [x27, #4]")     // R1
+    #expect(popSlot0 != nil && popStoreR1 != nil)
+    if let popSlot0, let popStoreR1 { #expect(popSlot0.lowerBound < popStoreR1.lowerBound) }
+
+    // Slot 1 (R4) needs the +4 offset, computed into w12.
+    #expect(text.contains("add     w12, w9, #4"))
+    #expect(text.contains("ldr     w11, [x28, w12, uxtw]"))
+    #expect(text.contains("str     w11, [x27, #16]"))            // R4
+
+    // SP (R13) is restored only after both registers are read back, and by the
+    // count of registers popped (2 * 4 = 8) — not before, and not by the wrong amount.
+    let lastRegisterRead = text.range(of: "str     w11, [x27, #16]")
+    let spRestored = text.range(of: "add     w9, w9, #8")
+    #expect(lastRegisterRead != nil && spRestored != nil)
+    if let lastRegisterRead, let spRestored { #expect(lastRegisterRead.lowerBound < spRestored.lowerBound) }
+    #expect(text.contains("str     w9, [x27, #52]"))             // R13 written back
+}
+
+// `accessWidth` and `widthSuffix` must agree, or a byte/halfword access silently
+// reads/writes the wrong number of bytes and records the wrong width in the trace —
+// corrupting neighbouring memory with no diagnostic anywhere.
+
+@Test func byteAndHalfwordAccessesUseMatchingWidthSuffixesAndTraceWidths() {
+    let strb = lower(preamble + "\n    STRB R3, [R1]\n").0 ?? ""
+    #expect(strb.contains("strb    w11, [x28, w9, uxtw]"))
+    #expect(strb.contains("movz    w2, #1"))
+
+    let ldrb = lower(preamble + "\n    LDRB R3, [R1]\n").0 ?? ""
+    #expect(ldrb.contains("ldrb    w11, [x28, w9, uxtw]"))
+    #expect(ldrb.contains("mov     w1, wzr"))   // a load performs no store
+
+    let strh = lower(preamble + "\n    STRH R3, [R1]\n").0 ?? ""
+    #expect(strh.contains("strh    w11, [x28, w9, uxtw]"))
+    #expect(strh.contains("movz    w2, #2"))
+
+    let ldrh = lower(preamble + "\n    LDRH R3, [R1]\n").0 ?? ""
+    #expect(ldrh.contains("ldrh    w11, [x28, w9, uxtw]"))
+}
+
+// Spec §7.5: "Pre-index writes w9 back to Rn before the access" — the opposite
+// order from post-index (Rn+offset, then write back after). A driver that got this
+// backwards would still pass a bare `contains` check on each instruction; only the
+// ordering exposes it.
+
+@Test func preIndexedWriteBackHappensBeforeTheAccess() {
+    let text = lower(preamble + "\n    STR R3, [R1, #4]!\n").0 ?? ""
+    let writeBack = text.range(of: "str     w9, [x27, #4]")       // R1 written back
+    let access = text.range(of: "str     w11, [x28, w9, uxtw]")   // the actual store
+    #expect(writeBack != nil && access != nil)
+    if let writeBack, let access { #expect(writeBack.lowerBound < access.lowerBound) }
+}
+
+// Spec §7.5: every BL target opens a frame so its return sequence (BX LR / MOV PC,
+// LR's `ldp`/`ret`) has something to pop, and BL/B trace *before* branching so the
+// branch stays the block's last instruction.
+
+@Test func blTargetsGetAFramePrologueAndTraceBeforeTheBranch() {
+    let text = lower("""
+        AREA PROGRAM, CODE, READONLY
+        ENTRY
+    MAIN
+        BL CALLEE
+        MOV R1, #1
+    CALLEE
+        MOV PC, LR
+    """).0 ?? ""
+    #expect(text.contains("Larm7_CALLEE:\n        stp     x29, x30, [sp, #-16]!"))
+    let traceCall = text.range(of: "bl      _armd_trace")
+    let branch = text.range(of: "\(Lowering.pad("bl"))Larm7_CALLEE")
+    #expect(traceCall != nil && branch != nil)
+    if let traceCall, let branch { #expect(traceCall.lowerBound < branch.lowerBound) }
 }
