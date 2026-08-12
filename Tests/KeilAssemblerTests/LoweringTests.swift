@@ -491,13 +491,21 @@ MAIN
     // BL call target — CALLEE below is one — so this must be the scenario, not
     // top-level MAIN (see `topLevelReturnBranchesToExitInsteadOfPoppingAnUnpushedFrame`
     // for the case that used to pop a frame nobody pushed).
+    //
+    // R1 (frame dataflow): MAIN branches past CALLEE rather than falling into it.
+    // Without the `B DONE`, CALLEE's body would be reachable *both* via `BL` and by
+    // fall-through from top-level MAIN, which has no correct lowering at all (E044) —
+    // see `aReturnReachableInBothStatesIsDiagnosedRatherThanGuessed`.
     let (assembly, bag) = lower("""
         AREA PROGRAM, CODE, READONLY
         ENTRY
     MAIN
         BL CALLEE
+        B DONE
     CALLEE
         MOV PC, LR
+    DONE
+        MOV R1, #1
     """)
     #expect(bag.hasErrors == false)
     let text = assembly ?? ""
@@ -689,8 +697,11 @@ MAIN
     MAIN
         BL CALLEE
         MOV R1, #1
+        B DONE
     CALLEE
         MOV PC, LR
+    DONE
+        MOV R2, #2
     """).0 ?? ""
     #expect(text.contains("Larm7_CALLEE:\n        stp     x29, x30, [sp, #-16]!"))
     let traceCall = text.range(of: "bl      _armd_trace")
@@ -742,18 +753,23 @@ MAIN
     // lived. Positive companion to `malformedBXProducesADiagnosticInsteadOfSilentlyReturning`.
     //
     // Final fix wave (Important 2): as with `MOV PC, LR`, the frame this pops is
-    // only real inside a BL call target.
+    // only real inside a BL call target. R1 (frame dataflow): MAIN branches past
+    // CALLEE so CALLEE's body is reachable in the in-callee state *only*.
     let (assembly, bag) = lower("""
         AREA PROGRAM, CODE, READONLY
         ENTRY
     MAIN
         BL CALLEE
+        B DONE
     CALLEE
         BX LR
+    DONE
+        MOV R1, #1
     """)
     #expect(bag.hasErrors == false)
     let text = assembly ?? ""
-    #expect(text.contains("ldp     x29, x30, [sp], #16"))
+    // Two `ldp x29, x30` in total: CALLEE's own return, and the §7.9 epilogue's.
+    #expect(text.components(separatedBy: "ldp     x29, x30, [sp], #16").count - 1 == 2)
     #expect(text.contains("ret"))
 }
 
@@ -830,15 +846,20 @@ MAIN
     // storing the popped word there would show a stale return address instead
     // of "this instruction's own address"), then the same ldp/ret CALLEE's own
     // BL-opened frame expects.
+    // R1 (frame dataflow): MAIN branches past CALLEE, so CALLEE's `POP {R4, PC}`
+    // is reachable in the in-callee state only.
     let (assembly, bag) = lower("""
         AREA PROGRAM, CODE, READONLY
         ENTRY
     MAIN
         BL CALLEE
+        B DONE
     CALLEE
         PUSH {R4, LR}
         MOV R4, #1
         POP {R4, PC}
+    DONE
+        MOV R1, #1
     """)
     #expect(bag.hasErrors == false)
     let text = assembly ?? ""

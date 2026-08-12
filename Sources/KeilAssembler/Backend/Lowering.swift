@@ -86,51 +86,16 @@ extension Lowering {
                 return name
             })
 
-            // R1 (re-review): a label that a top-level, unconditional `B` (not `BL`,
-            // not a conditional branch — those are either loop back-edges internal to
-            // a callee or the skip-guard machinery, neither of which leaves a frame's
-            // region) jumps to is where control returns to a no-frame context, the
-            // same way the entry label below is. `B FINISH` after a `BL HELPER` is
-            // the idiom this exists for.
-            let topLevelBranchTargets: Set<String> = Set(analysed.program.lines.compactMap { line in
-                guard case .instruction(let instruction)? = line.statement,
-                      instruction.mnemonic == .b,
-                      instruction.condition == .al,
-                      case .labelReference(let name)? = instruction.operands.first else { return nil }
-                return name
-            })
-
-            // Spec §7.5: a return sequence (`BX LR` / `MOV PC, LR` / `POP {..., PC}`)
-            // only has a frame to pop once execution has passed a call-target label —
-            // the `stp` those labels open above — and has not since passed a label
-            // that marks a return to a no-frame context. The previous wave's premise
-            // that call targets are always written after their callers and never
-            // interleaved back into top-level flow is false (a callee can be written
-            // before its caller; a caller can resume at a label after its callee, as
-            // `B FINISH` does), so the latch can't just go true once and stay there —
-            // it has to be re-derived at every label:
-            //   - a call-target label opens a fresh frame: latch = true.
-            //   - a label the entry point lands on, or that a top-level unconditional
-            //     `B` targets, is a genuine return to no-frame top-level code: latch
-            //     = false.
-            //   - any other label (a callee's own internal loop head, reached only via
-            //     a conditional back-edge or fall-through, never via a top-level jump)
-            //     leaves the latch as it was — still inside whichever frame, if any,
-            //     was last opened.
-            // It is not reset on a *return instruction* itself, because a callee may
-            // contain more than one (e.g. a conditional early return followed by a
-            // later unconditional one), and both need the same "inside a call target"
-            // treatment for as long as the latch's label-derived state says so.
-            var insideCallTargetFrame = false
+            // Spec §7.5: which frame a return sequence has to pop is a *reachability*
+            // property of the control-flow graph, not anything a lexical scan of the
+            // source can decide — see `frameReachability`.
+            let frames = frameReachability(of: analysed, callTargets: callTargets)
 
             for (index, line) in analysed.program.lines.enumerated() {
                 if let label = line.label, analysed.symbols.labels[label] != nil {
                     builder.label(Emitter.armLabel(label))
                     if callTargets.contains(label) {
                         builder.instruction("stp     x29, x30, [sp, #-16]!")
-                        insideCallTargetFrame = true
-                    } else if topLevelBranchTargets.contains(label) {
-                        insideCallTargetFrame = false
                     }
                 }
 
@@ -139,11 +104,6 @@ extension Lowering {
                 if !entryEmitted, let entryIndex = analysed.entryLineIndex, index > entryIndex {
                     builder.label(entryLabel)
                     entryEmitted = true
-                    // The entry point is where the program's real, dynamic execution
-                    // begins — with no frame on the stack, whatever the latch drifted
-                    // to while lexically scanning past any call-target labels written
-                    // earlier in the file (a callee defined before its caller).
-                    insideCallTargetFrame = false
                 }
 
                 let address = analysed.addresses[index] ?? Analyser.origin
@@ -160,7 +120,7 @@ extension Lowering {
 
                 emit(
                     instruction, address: address, sourceLine: instruction.range.line,
-                    symbols: analysed.symbols, insideCallTarget: insideCallTargetFrame,
+                    symbols: analysed.symbols, frame: frames[index],
                     into: &builder, diagnostics: &bag
                 )
 
@@ -178,16 +138,111 @@ extension Lowering {
         return text
     }
 
-    /// Spec §7.5. `insideCallTarget` is Spec §7.5's frame invariant, threaded down
-    /// from `lower`'s per-line latch (see its declaration): true once emission has
-    /// passed a `BL` target's label, so a return sequence here has an open frame
-    /// to pop. Outside one, a return branches to the shared exit label instead.
+    // MARK: - Frame reachability (Spec §7.5, §7.9)
+
+    /// The two frame contexts a line can be reached in. A line reachable in both
+    /// has no correct return lowering at all — `emitReturn` diagnoses it.
+    struct FrameReachability: OptionSet, Sendable {
+        let rawValue: Int
+        /// Reached with only the host `_main` prologue's frame open (Spec §7.9).
+        static let topLevel = FrameReachability(rawValue: 1 << 0)
+        /// Reached with a `BL` target's own `stp x29, x30, [sp, #-16]!` open.
+        static let inCallee = FrameReachability(rawValue: 1 << 1)
+    }
+
+    /// Forward dataflow over `program.lines`, one lattice value per line.
+    ///
+    /// Seeds: the `ENTRY` line is top level; every label a `BL` targets is in a
+    /// callee. Edges: fall-through from the preceding line, plus one edge from
+    /// each `B` to its target's line — conditional branches included, since a
+    /// `BEQ` is a real edge. `BL` is deliberately *not* an edge: it is a call,
+    /// its callee's region is seeded independently, and the line after it
+    /// continues the caller's own state.
+    ///
+    /// The transfer function is a union, so the sweep is monotone over a two-bit
+    /// lattice: at most `2 * lines.count` bits can ever be set, so that many
+    /// change-making passes is a hard bound and the fixed point is guaranteed.
+    static func frameReachability(
+        of analysed: AnalysedProgram, callTargets: Set<String>
+    ) -> [FrameReachability] {
+        let lines = analysed.program.lines
+        var labelLine: [String: Int] = [:]
+        for (index, line) in lines.enumerated() {
+            if let label = line.label, labelLine[label] == nil { labelLine[label] = index }
+        }
+
+        var state = [FrameReachability](repeating: [], count: lines.count)
+        if let entry = analysed.entryLineIndex { state[entry].insert(.topLevel) }
+        for target in callTargets {
+            if let index = labelLine[target] { state[index].insert(.inCallee) }
+        }
+
+        var converged = false
+        for _ in 0...(2 * lines.count) {
+            var changed = false
+            for (index, line) in lines.enumerated() where !state[index].isEmpty {
+                let value = state[index]
+                var successors: [Int] = []
+                if !terminatesFallThrough(line), index + 1 < lines.count { successors.append(index + 1) }
+                if let name = branchTargetLabel(line), let target = labelLine[name] { successors.append(target) }
+                for successor in successors where !state[successor].isSuperset(of: value) {
+                    state[successor].formUnion(value)
+                    changed = true
+                }
+            }
+            if !changed { converged = true; break }
+        }
+        assert(converged, "Spec §7.5 frame reachability failed to converge")
+        return state
+    }
+
+    /// Spec §7.5: an unconditional `B` or return sequence is the last thing its
+    /// block executes — nothing falls out of it. A *conditional* one still falls
+    /// through when its condition is false, so it is not a terminator.
+    static func terminatesFallThrough(_ line: Line) -> Bool {
+        guard case .instruction(let instruction)? = line.statement,
+              instruction.condition == .al else { return false }
+        return instruction.mnemonic == .b || isReturn(instruction)
+    }
+
+    /// The label a `B` transfers control to, conditional or not. `BL` is excluded
+    /// deliberately — see `frameReachability`.
+    static func branchTargetLabel(_ line: Line) -> String? {
+        guard case .instruction(let instruction)? = line.statement,
+              instruction.mnemonic == .b,
+              case .labelReference(let name)? = instruction.operands.first else { return nil }
+        return name
+    }
+
+    /// Spec §7.5's three return spellings, matched exactly as their lowering
+    /// cases below match them.
+    static func isReturn(_ instruction: Instruction) -> Bool {
+        switch instruction.mnemonic {
+        case .bx:
+            return instruction.operands.first == .operand2(.register(14))
+        case .mov:
+            return !instruction.setsFlags
+                && instruction.operands.first == .register(15)
+                && instruction.operands.dropFirst().first == .operand2(.register(14))
+        case .pop, .ldmfd:
+            guard case .registerList(let registers)? = instruction.operands.last else { return false }
+            return registers.last == 15
+        default:
+            return false
+        }
+    }
+
+    // MARK: - Instruction lowering
+
+    /// Spec §7.5. `frame` is this line's `frameReachability` value: which frame,
+    /// if any, is open when control arrives here, and therefore which return
+    /// sequence a `BX LR` / `MOV PC, LR` / `POP {..., PC}` on it must emit.
     static func emit(
         _ instruction: Instruction,
         address: UInt32,
         sourceLine: Int,
         symbols: SymbolTable,
-        insideCallTarget: Bool,
+        frame: FrameReachability,
         into builder: inout AssemblyBuilder,
         diagnostics: inout DiagnosticBag
     ) {
@@ -222,7 +277,7 @@ extension Lowering {
             if instruction.mnemonic == .mov, !instruction.setsFlags,
                destination == 15, source == .operand2(.register(14)) {
                 Emitter.trace(line: sourceLine, storeAddressRegister: nil, storeWidth: 0, into: &builder)
-                emitReturn(insideCallTarget: insideCallTarget, into: &builder)
+                emitReturn(frame, range: range, into: &builder, diagnostics: &diagnostics)
                 return
             }
             materialise(source, symbols: symbols, address: address, range: range, into: &builder, diagnostics: &diagnostics)
@@ -463,7 +518,7 @@ extension Lowering {
                 Emitter.storeRegister(13, from: "w9", into: &builder)
                 Emitter.trace(line: sourceLine, storeAddressRegister: nil, storeWidth: 0, into: &builder)
                 if returnsThroughLR {
-                    emitReturn(insideCallTarget: insideCallTarget, into: &builder)
+                    emitReturn(frame, range: range, into: &builder, diagnostics: &diagnostics)
                 }
             }
             return
@@ -503,7 +558,7 @@ extension Lowering {
                 unsupported(instruction, into: &diagnostics); return
             }
             Emitter.trace(line: sourceLine, storeAddressRegister: nil, storeWidth: 0, into: &builder)
-            emitReturn(insideCallTarget: insideCallTarget, into: &builder)
+            emitReturn(frame, range: range, into: &builder, diagnostics: &diagnostics)
             return
         }
 
@@ -511,14 +566,41 @@ extension Lowering {
     }
 
     /// Spec §7.5's return sequence, shared by `BX LR`, `MOV PC, LR`, and
-    /// `POP`/`LDMFD {..., PC}`. Inside a call target, the frame that label's
-    /// prologue opened is real, so pop it and `ret`. Outside one (Important 2:
-    /// a top-level `BX LR`/`MOV PC, LR` is the ordinary way to end a program with
-    /// no subroutines), there is no frame here to pop — branching to the shared
-    /// exit label ends the program the way it means, instead of popping the host
-    /// prologue's own saved register pairs and returning through garbage.
-    static func emitReturn(insideCallTarget: Bool, into builder: inout AssemblyBuilder) {
-        if insideCallTarget {
+    /// `POP`/`LDMFD {..., PC}`, selected by this line's `frameReachability`.
+    ///
+    /// Reached only inside a callee, the frame that `BL` target's label opened is
+    /// real, so pop it and `ret`. Reached only at top level (a `BX LR`/`MOV PC, LR`
+    /// is the ordinary way to end a program with no subroutines), there is no
+    /// frame here to pop — branching to the shared exit label ends the program the
+    /// way it means, instead of popping the host prologue's own saved x27/x28 pair
+    /// and returning through the memory base pointer.
+    ///
+    /// Reached in *both*, neither sequence is correct on both paths and there is
+    /// nothing to guess between: the program is genuinely ambiguous (its callee's
+    /// body is also reachable by falling through from top-level code), so say so
+    /// rather than silently picking one and crashing on the other path.
+    ///
+    /// An unreachable return — dead code, an empty lattice value — is not an error;
+    /// it emits the exit branch, which is the sequence that cannot corrupt the
+    /// host stack if it somehow does run.
+    static func emitReturn(
+        _ frame: FrameReachability,
+        range: SourceRange,
+        into builder: inout AssemblyBuilder,
+        diagnostics: inout DiagnosticBag
+    ) {
+        guard frame != [.topLevel, .inCallee] else {
+            diagnostics.emit(Diagnostic(
+                severity: .error, code: "E044",
+                message: "this return is reachable both inside a subroutine and at top level",
+                range: range,
+                note: "a subroutine's body must not also be reached by falling through from "
+                    + "the code that calls it — branch past it (`B` to a label after the "
+                    + "subroutine) or end the top-level path with its own return; see Spec §7.5"
+            ))
+            return
+        }
+        if frame.contains(.inCallee) {
             builder.instruction("ldp     x29, x30, [sp], #16")
             builder.instruction("ret")
         } else {

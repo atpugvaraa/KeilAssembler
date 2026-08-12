@@ -333,9 +333,30 @@ order at ascending addresses. `POP` reverses it.
 
 **Branch.** `B label` → `b Larm7_label`. `BL label` → set R14 to the ARM7 address of the next
 instruction (for display), then `bl Larm7_label`. Any label that is the target of a `BL` is
-emitted with `stp x29, x30, [sp, #-16]!` at entry; `BX LR` and `MOV PC, LR` emit
-`ldp x29, x30, [sp], #16` · `ret`. Nested and recursive calls work. `BX Rm` where Rm ≠ LR, and
-any other write to R15, are rejected: `E014: computed branch not supported`.
+emitted with `stp x29, x30, [sp, #-16]!` at entry. Nested and recursive calls work. `BX Rm` where
+Rm ≠ LR, and any other write to R15, are rejected: `E014: computed branch not supported`.
+
+**Returns.** `BX LR`, `MOV PC, LR`, and `POP`/`LDMFD {..., PC}` are the three return spellings.
+Which sequence each one lowers to depends on which frame is open where it sits, and that is a
+reachability property of the control-flow graph — no lexical property of the source decides it.
+A forward dataflow pass over the program's lines computes, for each line, a value in the lattice
+`{ topLevel, inCallee, both }`:
+
+- **Seeds.** The `ENTRY` line is `topLevel`; every label that is the target of a `BL` is
+  `inCallee`.
+- **Edges.** Fall-through from the preceding line, plus one edge from each `B` to its target
+  label — conditional branches included, since a `BEQ` is a real edge. An unconditional `B` and
+  an unconditional return terminate fall-through; conditional ones do not. `BL` is a *call*, not
+  an edge: its callee's region is seeded independently, and the line after a `BL` continues the
+  caller's state.
+- **Iteration.** To a fixed point; back-edges mean one pass is not enough. The lattice is two
+  bits over a finite line count, so the sweep terminates.
+
+A return in the `inCallee` state emits `ldp x29, x30, [sp], #16` · `ret`, popping the frame its
+`BL` target's label opened. A return in the `topLevel` state emits `b Larmd_exit`: there is no
+callee frame there, and popping would take the §7.9 host prologue's own saved x27/x28 pair and
+`ret` through the memory base pointer. A return in the `both` state has no correct lowering on
+both paths and is rejected: `E044`. An unreachable return is not an error and emits `b Larmd_exit`.
 
 ### 7.6 `LDR` forms
 
@@ -518,6 +539,7 @@ the row in the same commit as the code.**
 | `E041` | expected `,` between registers in a register list | Parser |
 | `E042` | a name is defined more than once, or as both a label and an EQU constant | Analyser |
 | `E043` | `.` (current position) is not valid inside an EQU expression | Analyser |
+| `E044` | return reachable both inside a subroutine and at top level | Backend |
 | `W001` | statement in the label column | Parser |
 | `W002` | stray `,` after a data directive | Parser |
 | `W003` | `AREA` attribute ignored | Parser |
@@ -526,7 +548,7 @@ the row in the same commit as the code.**
 | `W011` | unaligned access not modelled (§9 D4) | Analyser |
 | `W012` | shift amount ≥ 32 (§9 D8) | Analyser |
 
-Next free error code: `E044`. Next free warning code: `W005` (or `W013` in the deviation band).
+Next free error code: `E045`. Next free warning code: `W005` (or `W013` in the deviation band).
 
 ## 9. Deviations from real ARM7
 
