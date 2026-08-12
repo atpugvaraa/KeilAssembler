@@ -192,3 +192,252 @@ private func materialise(_ operand2: Operand2) -> String {
         #expect(kind.variableMnemonic.count < 8)
     }
 }
+
+// MARK: - Driver and data-processing lowering (Task 15)
+
+private func lower(_ source: String) -> (String?, DiagnosticBag) {
+    var bag = DiagnosticBag()
+    let tokens = Lexer(source: source).tokenize(into: &bag)
+    var parser = Parser(tokens: tokens)
+    let program = parser.parse(into: &bag)
+    let analysed = Analyser.analyse(program, into: &bag)
+    return (Lowering.lower(analysed, into: &bag), bag)
+}
+
+private let preamble = """
+    AREA PROGRAM, CODE, READONLY
+    ENTRY
+MAIN
+"""
+
+@Test func lowersAnAddToLoadOperateStore() {
+    let (assembly, bag) = lower(preamble + "\n    ADD R4, R1, R2\n")
+    #expect(bag.hasErrors == false)
+    let text = assembly ?? ""
+    #expect(text.contains("ldr     w9, [x27, #4]"))     // R1
+    #expect(text.contains("ldr     w10, [x27, #8]"))    // R2
+    #expect(text.contains("add     w11, w9, w10"))
+    #expect(text.contains("str     w11, [x27, #16]"))   // R4
+}
+
+@Test func lowersMvnAndComparisons() {
+    #expect((lower(preamble + "\n    MVN R2, R1\n").0 ?? "").contains("mvn     w11, w10"))
+    #expect((lower(preamble + "\n    CMP R1, #4\n").0 ?? "").contains("subs    wzr, w9, w10"))
+    #expect((lower(preamble + "\n    TST R1, R2\n").0 ?? "").contains("ands    wzr, w9, w10"))
+}
+
+@Test func setFlagsVariantsStoreTheCPSR() {
+    let text = lower(preamble + "\n    MOVS R3, #0\n").0 ?? ""
+    #expect(text.contains("ands    w11, w10, w10"))
+    #expect(text.contains("mrs     x9, nzcv"))
+    #expect(text.contains("str     w9, [x27, #64]"))
+}
+
+@Test func conditionalInstructionsAreGuardedByTheInverseBranch() {
+    // Spec §6.1, §7.3.
+    let text = lower(preamble + "\n    MOVEQ R3, R1\n").0 ?? ""
+    #expect(text.contains("ldr     w9, [x27, #64]"))
+    #expect(text.contains("msr     nzcv, x9"))
+    #expect(text.contains("b.ne    Lskip_"))
+}
+
+@Test func everyInstructionEndsWithATraceCall() {
+    let text = lower(preamble + "\n    MOV R1, #0x12\n").0 ?? ""
+    #expect(text.contains("bl      _armd_trace"))
+}
+
+@Test func loweringRefusesToEmitWhenThereAreErrors() {
+    let (assembly, bag) = lower(preamble + "\n    MOV R1, #0x101\n")
+    #expect(bag.hasErrors)
+    #expect(assembly == nil)      // Spec §8: a build with any error emits no assembly
+}
+
+// The brief's own tests above only exercise ADD, MVN, CMP, TST, MOVS and MOVEQ out of
+// the ten-row `arithmetic(_:)` table. A wrong row there produces valid-looking assembly
+// that computes the wrong answer — no type checker catches a transposed operand order or
+// a stray `S`. Each test below pins exactly the row it would catch a regression in.
+
+@Test func rsbAndRscReverseTheirOperands() {
+    // Spec §7.5: RSB/RSC lower as `sub`/`sbc` with w10 and w9 swapped, not a distinct
+    // A64 instruction. A `.rsb` row that forgot to reverse would emit
+    // "sub     w11, w9, w10" (ADD/SUB's order) instead — this pins the swap.
+    let rsb = lower(preamble + "\n    RSB R4, R1, R2\n").0 ?? ""
+    #expect(rsb.contains("sub     w11, w10, w9"))
+    #expect(!rsb.contains("sub     w11, w9, w10"))
+
+    // RSC also restores C before operating (it reads carry), on top of the reversal.
+    let rsc = lower(preamble + "\n    RSC R4, R1, R2\n").0 ?? ""
+    #expect(rsc.contains("ldr     w9, [x27, #64]"))
+    #expect(rsc.contains("msr     nzcv, x9"))
+    #expect(rsc.contains("sbc     w11, w10, w9"))
+}
+
+@Test func carryConsumingInstructionsRestoreFlagsBeforeOperating() {
+    // Spec §7.5: ADC/SBC read C from the CPSR before operating, unlike ADD/SUB. A
+    // wrong implementation that treated ADC like ADD (skipping the restore) would
+    // still produce plausible-looking `adc` text but read whatever PSTATE.C happens
+    // to hold after the preceding `bl _armd_trace` — garbage, not ARM7's C.
+    let adc = lower(preamble + "\n    ADC R4, R1, R2\n").0 ?? ""
+    #expect(adc.contains("ldr     w9, [x27, #64]"))
+    #expect(adc.contains("msr     nzcv, x9"))
+    #expect(adc.contains("adc     w11, w9, w10"))
+
+    let sbc = lower(preamble + "\n    SBC R4, R1, R2\n").0 ?? ""
+    #expect(sbc.contains("ldr     w9, [x27, #64]"))
+    #expect(sbc.contains("msr     nzcv, x9"))
+    #expect(sbc.contains("sbc     w11, w9, w10"))
+
+    // ADD does NOT restore flags first — it doesn't read carry. Pinning the absence
+    // catches an implementation that restored flags unconditionally for every mnemonic.
+    let add = lower(preamble + "\n    ADD R4, R1, R2\n").0 ?? ""
+    #expect(!add.contains("msr     nzcv"))
+}
+
+@Test func andAndBicUseTheirOwnNativeFlagSettingForms() {
+    // Spec §7.5: AND/BIC have native `ands`/`bics` A64 forms, unlike ORR/EOR. A row
+    // that copied the ORR/EOR "ands trick" onto AND or BIC would look plausible but
+    // emit a redundant/wrong second instruction instead of the native `S` form.
+    let and = lower(preamble + "\n    AND R4, R1, R2\n").0 ?? ""
+    #expect(and.contains("and     w11, w9, w10"))
+
+    let ands = lower(preamble + "\n    ANDS R4, R1, R2\n").0 ?? ""
+    #expect(ands.contains("ands    w11, w9, w10"))
+    #expect(ands.contains("mrs     x9, nzcv"))
+
+    let bic = lower(preamble + "\n    BIC R4, R1, R2\n").0 ?? ""
+    #expect(bic.contains("bic     w11, w9, w10"))
+
+    let bics = lower(preamble + "\n    BICS R4, R1, R2\n").0 ?? ""
+    #expect(bics.contains("bics    w11, w9, w10"))
+    #expect(bics.contains("mrs     x9, nzcv"))
+}
+
+@Test func orrAndEorHaveNoFlagSettingFormAndUseTheAndsTrick() {
+    // Spec §7.5/§7.12: ORR/EOR emit the plain `orr`/`eor` unconditionally (never
+    // `orrs`/`eors` — A64 has no such form), and `S` is realised by a *following*
+    // `ands w11, w11, w11`. An implementation that emitted `orrs`/`eors` directly
+    // would assemble to a different (wrong) opcode; one that omitted the trailing
+    // `ands` for the S variant would silently never update N/Z.
+    let orr = lower(preamble + "\n    ORR R4, R1, R2\n").0 ?? ""
+    #expect(orr.contains("orr     w11, w9, w10"))
+    #expect(!orr.contains("orrs"))
+
+    let orrs = lower(preamble + "\n    ORRS R4, R1, R2\n").0 ?? ""
+    #expect(orrs.contains("orr     w11, w9, w10"))
+    #expect(orrs.contains("ands    w11, w11, w11"))
+    #expect(!orrs.contains("orrs"))
+    #expect(orrs.contains("mrs     x9, nzcv"))
+
+    let eors = lower(preamble + "\n    EORS R4, R1, R2\n").0 ?? ""
+    #expect(eors.contains("eor     w11, w9, w10"))
+    #expect(eors.contains("ands    w11, w11, w11"))
+    #expect(!eors.contains("eors"))
+}
+
+@Test func subUsesTheNativeSubsForm() {
+    // Rounds out ADD/SUB (the "native adds/subs" S-suffix shape) — the brief's own
+    // tests only cover ADD unsuffixed; this pins SUB and its S-suffixed sibling.
+    let sub = lower(preamble + "\n    SUB R4, R1, R2\n").0 ?? ""
+    #expect(sub.contains("sub     w11, w9, w10"))
+
+    let subs = lower(preamble + "\n    SUBS R4, R1, R2\n").0 ?? ""
+    #expect(subs.contains("subs    w11, w9, w10"))
+    #expect(subs.contains("mrs     x9, nzcv"))
+}
+
+@Test func cmnAndTeqAlwaysSetFlagsRegardlessOfAnSSuffix() {
+    // Spec §6.3: CMP/CMN/TST/TEQ always set flags and have no destination — a fourth
+    // shape distinct from both "native S" and the ORR/EOR trick. TEQ additionally has
+    // no direct A64 opcode at all: it's synthesised from `eor` + `ands`.
+    let cmn = lower(preamble + "\n    CMN R1, R2\n").0 ?? ""
+    #expect(cmn.contains("adds    wzr, w9, w10"))
+    #expect(cmn.contains("mrs     x9, nzcv"))
+
+    let teq = lower(preamble + "\n    TEQ R1, R2\n").0 ?? ""
+    #expect(teq.contains("eor     w11, w9, w10"))
+    #expect(teq.contains("ands    wzr, w11, w11"))
+    #expect(teq.contains("mrs     x9, nzcv"))
+}
+
+@Test func mulAndMlaLowerToTheirA64Forms() {
+    // MUL/MLA are their own operand shape entirely (three or four registers, no
+    // Operand2), sharing nothing with the arithmetic table — a plausible but wrong
+    // implementation could easily swap the multiply-add's operand order.
+    let mul = lower(preamble + "\n    MUL R4, R1, R2\n").0 ?? ""
+    #expect(mul.contains("ldr     w9, [x27, #4]"))    // R1
+    #expect(mul.contains("ldr     w10, [x27, #8]"))   // R2
+    #expect(mul.contains("mul     w11, w9, w10"))
+    #expect(mul.contains("str     w11, [x27, #16]"))  // R4
+
+    let mla = lower(preamble + "\n    MLA R4, R1, R2, R3\n").0 ?? ""
+    #expect(mla.contains("ldr     w9, [x27, #4]"))    // R1 (multiplicand)
+    #expect(mla.contains("ldr     w10, [x27, #8]"))   // R2 (multiplier)
+    #expect(mla.contains("ldr     w12, [x27, #12]"))  // R3 (addend)
+    #expect(mla.contains("madd    w11, w9, w10, w12"))
+    #expect(mla.contains("str     w11, [x27, #16]"))  // R4
+}
+
+@Test func entryLabelLandsOnTheFirstLineWhenEntryIsFirst() {
+    // Confirms §7.9's `b Lentry` target is placed correctly when ENTRY is the very
+    // first statement in the program, and that the label appears exactly once — a
+    // driver that emitted it once per instruction, or never advanced `entryEmitted`,
+    // would either duplicate the label (an assembler error) or omit it entirely.
+    let text = lower(preamble + "\n    MOV R1, #1\n").0 ?? ""
+    let entryCount = text.components(separatedBy: "Larmd_entry:").count - 1
+    #expect(entryCount == 1)
+    // The entry label must precede the first lowered instruction's load, not follow it.
+    let entryRange = text.range(of: "Larmd_entry:")
+    let loadRange = text.range(of: "movz    w10, #0x1")
+    #expect(entryRange != nil && loadRange != nil)
+    if let entryRange, let loadRange {
+        #expect(entryRange.lowerBound < loadRange.lowerBound)
+    }
+}
+
+@Test func entryLabelLandsAfterEntryWhenItFollowsOtherStatements() {
+    // Same guarantee, but for a program where ENTRY is not the first line — the
+    // label must still land exactly once, and specifically after the ENTRY
+    // directive rather than at the top of the program (which a driver that only
+    // checked `index == 0` would get wrong).
+    let source = """
+        AREA PROGRAM, CODE, READONLY
+    BEFORE
+        MOV R2, #2
+        ENTRY
+    MAIN
+        MOV R1, #1
+    """
+    let text = lower(source + "\n").0 ?? ""
+    let entryCount = text.components(separatedBy: "Larmd_entry:").count - 1
+    #expect(entryCount == 1)
+
+    let entryRange = text.range(of: "Larmd_entry:")
+    let firstLoad = text.range(of: "movz    w10, #0x2")   // MOV R2, #2 — before ENTRY
+    let secondLoad = text.range(of: "movz    w10, #0x1")  // MOV R1, #1 — after ENTRY
+    #expect(entryRange != nil && firstLoad != nil && secondLoad != nil)
+    if let entryRange, let firstLoad, let secondLoad {
+        #expect(firstLoad.lowerBound < entryRange.lowerBound)
+        #expect(entryRange.lowerBound < secondLoad.lowerBound)
+    }
+}
+
+@Test func skipLabelsAreUniquePerConditionalInstruction() {
+    // Spec §18 concern: `skipCounter` must mint a distinct label per conditional
+    // instruction. Two conditional instructions in one program that produced the
+    // same `Lskip_N` label would be a silent assembler error (duplicate label), not
+    // a crash — this test would only pass if both distinct labels are present.
+    let text = lower(preamble + "\n    MOVEQ R1, R2\n    MOVNE R3, R4\n").0 ?? ""
+    #expect(text.contains("Lskip_0:"))
+    #expect(text.contains("Lskip_1:"))
+    #expect(!text.contains("Lskip_2"))
+}
+
+@Test func unconditionalInstructionsEmitNoGuard() {
+    // `Condition.al` returns nil from `inverseBranchSuffix`, so an AL instruction
+    // must emit no skip branch at all. An implementation that always emitted a
+    // guard (even a `b.al`) would still "work" at runtime but would violate the
+    // brief's stated contract and pollute the output with dead branches.
+    let text = lower(preamble + "\n    MOV R1, #1\n").0 ?? ""
+    #expect(!text.contains("b.al"))
+    #expect(!text.contains("Lskip_"))
+}
