@@ -92,3 +92,103 @@ import Testing
     #expect(plain.text.contains("mov     w1, wzr"))
     #expect(plain.text.contains("mov     w2, wzr"))
 }
+
+// MARK: - Operand2 materialisation (Task 14, Spec §7.4)
+
+private func materialise(_ operand2: Operand2) -> String {
+    var builder = AssemblyBuilder()
+    var bag = DiagnosticBag()
+    Lowering.materialiseOperand2(
+        operand2, symbols: SymbolTable(), address: 0,
+        range: SourceRange(line: 0, column: 0, length: 0),
+        into: &builder, diagnostics: &bag
+    )
+    return builder.text
+}
+
+@Test func operand2AlwaysLandsInW10() {
+    #expect(materialise(.immediate(.integer(0x12))).contains("movz    w10, #0x12"))
+    #expect(materialise(.register(2)).contains("ldr     w10, [x27, #8]"))
+}
+
+@Test func shiftByImmediateUsesTheFixedShiftForm() {
+    let text = materialise(.shifted(register: 1, shift: ShiftSpec(kind: .lsl, amount: .integer(2))))
+    #expect(text.contains("ldr     w10, [x27, #4]"))
+    #expect(text.contains("lsl     w10, w10, #2"))
+}
+
+@Test func shiftByRegisterUsesTheVariableShiftForm() {
+    // Spec §7.4: A64 has no register-shifted operand, so it becomes lslv/lsrv/asrv/rorv.
+    let text = materialise(.shifted(register: 1, shift: ShiftSpec(kind: .lsr, amountRegister: 2)))
+    #expect(text.contains("ldr     w10, [x27, #4]"))
+    #expect(text.contains("ldr     w11, [x27, #8]"))
+    #expect(text.contains("lsrv    w10, w10, w11"))
+}
+
+// The brief pins LSL-by-immediate and LSR-by-register. A `variableMnemonic` that
+// returned the wrong suffix, or a fixed-shift path that ignored `shift.kind`
+// (e.g. always emitting `lsl`), would still pass those two cases. Pin the other
+// six kind/amount-form combinations so such a mistake fails immediately.
+
+@Test func shiftByImmediateCoversEveryFixedKind() {
+    #expect(materialise(.shifted(register: 1, shift: ShiftSpec(kind: .lsr, amount: .integer(3))))
+        .contains("lsr     w10, w10, #3"))
+    #expect(materialise(.shifted(register: 1, shift: ShiftSpec(kind: .asr, amount: .integer(4))))
+        .contains("asr     w10, w10, #4"))
+    #expect(materialise(.shifted(register: 1, shift: ShiftSpec(kind: .ror, amount: .integer(5))))
+        .contains("ror     w10, w10, #5"))
+}
+
+@Test func shiftByRegisterCoversEveryVariableKind() {
+    #expect(materialise(.shifted(register: 1, shift: ShiftSpec(kind: .lsl, amountRegister: 2)))
+        .contains("lslv    w10, w10, w11"))
+    #expect(materialise(.shifted(register: 1, shift: ShiftSpec(kind: .asr, amountRegister: 2)))
+        .contains("asrv    w10, w10, w11"))
+    #expect(materialise(.shifted(register: 1, shift: ShiftSpec(kind: .ror, amountRegister: 2)))
+        .contains("rorv    w10, w10, w11"))
+}
+
+@Test func rrxIsDiagnosedNotLowered() {
+    // Spec §7.4's RRX row defers to §9 D1, which never defines the sequence. A
+    // real implementation must refuse via E036, not guess and emit wrong output —
+    // so this checks the diagnostic itself, not just "no crash".
+    var builder = AssemblyBuilder()
+    var bag = DiagnosticBag()
+    let range = SourceRange(line: 3, column: 5, length: 1)
+    Lowering.materialiseOperand2(
+        .shifted(register: 1, shift: ShiftSpec(kind: .rrx)),
+        symbols: SymbolTable(), address: 0, range: range,
+        into: &builder, diagnostics: &bag
+    )
+    #expect(bag.hasErrors)
+    let diagnostic = bag.diagnostics.first { $0.code == "E036" }
+    #expect(diagnostic?.severity == .error)
+    #expect(diagnostic?.range == range)
+    // Spec §7.4's RRX row defers to §9 D1 (shifter-carry), not §12 ("Alternatives
+    // considered") — pin the correct cross-reference so a copy-paste slip regresses loudly.
+    #expect(diagnostic?.note == "Spec §7.4 leaves the RRX sequence undefined; see Spec §9 D1")
+    // The register load still happens before the diagnosis; no shift instruction follows.
+    #expect(builder.text.contains("ldr     w10, [x27, #4]"))
+    #expect(!builder.text.contains("rrx"))
+}
+
+@Test func padColumnAlignsMnemonicsUnderEightCharacters() {
+    // Every real mnemonic pad() sees here (lsl/lsr/asr/ror, and their v-suffixed
+    // register forms) is under 8 characters, so this is the width that matters.
+    #expect(Lowering.pad("lsl") == "lsl     ")
+    #expect(Lowering.pad("lslv") == "lslv    ")
+    #expect(Lowering.pad("lsl").count == 8)
+    #expect(Lowering.pad("lslv").count == 8)
+}
+
+@Test func padLeavesEightCharacterMnemonicsUnpaddedButNoRealMnemonicReachesThat() {
+    // `padding(toLength: max(count, 8), ...)` never truncates, but for a mnemonic
+    // already >= 8 characters it also adds no separating space — the next token
+    // would run straight into it. Document that limitation, and confirm no shift
+    // mnemonic this file ever emits is long enough to trigger it.
+    #expect(Lowering.pad("abcdefgh") == "abcdefgh")
+    for kind in ShiftKind.allCases {
+        #expect(kind.rawValue.count < 8)
+        #expect(kind.variableMnemonic.count < 8)
+    }
+}
