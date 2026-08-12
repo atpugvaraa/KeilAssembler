@@ -476,12 +476,18 @@ struct Parser {
                 return .operand2(operand2)
             }
             advance()
-            // `Rn!` outside `[...]` — e.g. `STMFD SP!, {R1, R4}` (Spec §6.3), the
-            // only spec-legal spelling of the writeback form. The base register
-            // carries no further meaning to Lowering (STMFD/LDMFD hardcode R13 as
-            // SP regardless of what's written here), so the `!` is simply consumed
-            // rather than left to trip the missing-comma check (E040) below.
-            _ = match(.bang)
+            // `Rn!` outside `[...]` is only meaningful for `STMFD`/`LDMFD`'s base
+            // register — e.g. `STMFD SP!, {R1, R4}` (Spec §6.3), the only
+            // spec-legal spelling of the writeback form; Lowering hardcodes R13 as
+            // SP regardless of what's written here, so the register is
+            // informational but the `!` still has to parse. Scoped to exactly
+            // those two mnemonics: consuming it unconditionally would silently
+            // swallow a stray `!` after *any* mnemonic's non-trailing bare
+            // register (e.g. `ADD R1!, R2, R3`), discarding the E040 that
+            // `parseInstruction`'s post-loop check exists to catch.
+            if mnemonic == .stmfd || mnemonic == .ldmfd {
+                _ = match(.bang)
+            }
             return .register(number)
         }
 

@@ -445,6 +445,22 @@ private func firstInstruction(_ source: String) -> Instruction? {
     #expect(firstInstruction("    MOV R1 LABEL\n")?.operands == [.register(1)])
 }
 
+// MARK: - Task 16 review round: `Rn!` must stay meaningless (and diagnosed) outside STMFD/LDMFD
+
+@Test func aStrayBangAfterANonTrailingRegisterIsStillDiagnosed() {
+    // Regression guard: fixing `STMFD SP!, {...}` (Spec §6.3's only legal writeback
+    // spelling) by having `parseOperand`'s bare-register branch unconditionally consume a
+    // trailing `!` also swallowed `!` after *any* mnemonic's non-trailing bare register —
+    // `ADD R1!, R2, R3` parsed as clean `ADD R1, R2, R3` with zero diagnostics, discarding
+    // the E040 that Task 7 added for exactly this class of typo. The `!` must only be
+    // consumed when it's actually meaningful (STMFD/LDMFD's base register); everywhere
+    // else it has to keep tripping E040.
+    let (program, bag) = parse("    ADD R1!, R2, R3\n")
+    #expect(bag.diagnostics.map(\.code) == ["E040"])
+    #expect(program.lines.count == 1)
+    #expect(firstInstruction("    ADD R1!, R2, R3\n")?.operands == [.register(1)])
+}
+
 // MARK: - Task 8: addressing modes, the three LDR forms, and register lists
 
 @Test func parserReadsTheThreeLDRFormsDistinctly() {
