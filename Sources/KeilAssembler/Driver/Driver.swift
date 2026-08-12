@@ -140,29 +140,60 @@ struct Driver: Sendable {
         process.standardError = errorPipe
         process.standardOutput = outputPipe
 
-        try process.run()
-
         // Both pipes must be drained concurrently, not one after the other: a
         // child that writes more than the pipe's kernel buffer (~64 KiB) to
         // stdout blocks on write() until someone reads it. Reading only
-        // stderr here (as an earlier version did) would deadlock the moment
-        // a linked program — clang included — ever produced that much
-        // stdout, since this thread would sit in readDataToEndOfFile() on
-        // stderr while the child sat blocked writing to stdout, with neither
-        // side able to proceed to waitUntilExit().
-        let outputHandle = outputPipe.fileHandleForReading
-        let errorHandle = errorPipe.fileHandleForReading
+        // stderr here would deadlock the moment a linked program — clang
+        // included — ever produced that much stdout, since this thread
+        // would sit reading stderr while the child sat blocked writing to
+        // stdout, with neither side able to proceed to waitUntilExit().
+        //
+        // An earlier version drained stdout with
+        // `DispatchQueue.global(qos: .utility).async { readDataToEndOfFile() }`.
+        // That deadlocks under heavy concurrency: the async block needs a
+        // worker thread of its own to even start, drawn from the same
+        // small, fixed-size pool that Swift Testing's parallel test
+        // execution uses for the *calling* thread. Once enough concurrent
+        // Driver-based tests exist to fill every pool thread with a thread
+        // blocked in this function (Task 19 was the first to grow the
+        // corpus past that point — 4 tests never exhausted the pool, but
+        // 14 does), the drain closures can never be scheduled and every
+        // in-flight invocation deadlocks forever. Confirmed by `sample`ing
+        // a hung `swift test --filter CorpusTests`: every cooperative-pool
+        // thread was parked in `_dlock_wait` inside the old `drainGroup.wait()`.
+        //
+        // `readabilityHandler` avoids this because it is driven by a kqueue
+        // readiness notification rather than a thread parked in a blocking
+        // read() — it does not consume a thread from the pool while
+        // waiting, so it cannot be starved by however many invocations are
+        // running concurrently.
+        final class Box: @unchecked Sendable { var data = Data() }
+        let stderrBox = Box()
         let drainGroup = DispatchGroup()
+
         drainGroup.enter()
-        DispatchQueue.global(qos: .utility).async {
-            _ = outputHandle.readDataToEndOfFile()
-            drainGroup.leave()
+        outputPipe.fileHandleForReading.readabilityHandler = { handle in
+            if handle.availableData.isEmpty {
+                handle.readabilityHandler = nil
+                drainGroup.leave()
+            }
         }
-        let errorData = errorHandle.readDataToEndOfFile()
+
+        drainGroup.enter()
+        errorPipe.fileHandleForReading.readabilityHandler = { handle in
+            let chunk = handle.availableData
+            if chunk.isEmpty {
+                handle.readabilityHandler = nil
+                drainGroup.leave()
+            } else {
+                stderrBox.data.append(chunk)
+            }
+        }
+
+        try process.run()
+        process.waitUntilExit()
         drainGroup.wait()
 
-        process.waitUntilExit()
-
-        return (process.terminationStatus, String(data: errorData, encoding: .utf8) ?? "")
+        return (process.terminationStatus, String(data: stderrBox.data, encoding: .utf8) ?? "")
     }
 }
