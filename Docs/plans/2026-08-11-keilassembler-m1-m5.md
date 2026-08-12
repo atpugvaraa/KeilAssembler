@@ -2425,6 +2425,23 @@ enum Analyser {
             var position = origin
             var inCodeArea = true
 
+            // Pass 0 — EQU pre-pass. `SPACE n` and `ALIGN n` are evaluated during
+            // layout, so any constant they name must already be bound. Diagnostics go
+            // to a scratch bag that is thrown away: an EQU whose expression references
+            // a label legitimately cannot resolve yet, and must not error here. Pass 1b
+            // re-evaluates every EQU against the real bag once labels are bound, so a
+            // genuinely undefined symbol is still reported exactly once.
+            for line in program.lines {
+                if case .directive(.equ(let symbol, let value))? = line.statement {
+                    var scratch = DiagnosticBag()
+                    if let resolved = ExpressionEvaluator.evaluate(
+                        value, symbols: symbols, here: 0, range: line.range, diagnostics: &scratch
+                    ) {
+                        symbols.constants[symbol] = resolved
+                    }
+                }
+            }
+
             // Pass 1 — layout. Sizes are known without evaluating any expression:
             // an instruction is 4 bytes and a data directive's size is its element
             // count, so forward references resolve in pass 2 without a fixpoint.
@@ -2487,7 +2504,14 @@ enum Analyser {
                         }
                         continue
 
-                    case .equ, .end, .ltorg, .export:
+                    case .equ:
+                        // `sym EQU expr` carries the line's label, and the constant is
+                        // bound in pass 1b. Falling through to the generic label binding
+                        // below would also register the name in `symbols.labels`, which
+                        // then trips the cross-dictionary collision check.
+                        continue
+
+                    case .end, .ltorg, .export:
                         break
                     }
                 }
@@ -2519,7 +2543,10 @@ enum Analyser {
                 ))
             }
 
-            // Pass 1b — EQU constants, now that labels are bound.
+            // Pass 1b — EQU constants, now that labels are bound. The pre-pass's entries
+            // are cleared first: leaving them would make every ordinary EQU look like a
+            // redefinition of itself and emit a spurious duplicate-symbol error.
+            symbols.constants = [:]
             for line in program.lines {
                 if case .directive(.equ(let symbol, let value))? = line.statement {
                     if let resolved = ExpressionEvaluator.evaluate(value, symbols: symbols, here: 0, range: line.range, diagnostics: &bag) {
