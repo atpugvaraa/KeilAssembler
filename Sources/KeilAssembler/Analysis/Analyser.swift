@@ -28,6 +28,9 @@ enum Analyser {
         let result = PerfLog.measure("analyse") { () -> AnalysedProgram in
             var symbols = SymbolTable()
             var addresses: [Int: UInt32] = [:]
+            /// Instructions collected during pass 1, checked once symbols are fully
+            /// bound (after pass 1b) — see `check` below.
+            var checkQueue: [(Instruction, UInt32)] = []
             /// Index into `program.lines` → the ARM7 address of that line's data.
             /// Recorded here in pass 1 so pass 2 never has to re-derive the layout,
             /// and so unlabelled data directives are addressable too.
@@ -190,7 +193,7 @@ enum Analyser {
                     bindLabel(label, at: position, range: line.range)
                 }
 
-                if case .instruction? = line.statement {
+                if case .instruction(let instruction)? = line.statement {
                     guard inCodeArea else {
                         bag.emit(Diagnostic(
                             severity: .error, code: "E035",
@@ -200,6 +203,7 @@ enum Analyser {
                         continue
                     }
                     addresses[index] = position
+                    checkQueue.append((instruction, position))
                     position &+= 4
                 }
             }
@@ -226,6 +230,12 @@ enum Analyser {
                         bindConstant(symbol, value: resolved, range: line.range)
                     }
                 }
+            }
+
+            // Semantic diagnostics — every symbol is bound now, so instructions queued
+            // during pass 1 can be checked for real (Spec §6.2, §9 D1/D2/D8).
+            for (instruction, address) in checkQueue {
+                check(instruction, symbols: symbols, address: address, diagnostics: &bag)
             }
 
             // Pass 2 — evaluate data.
@@ -287,5 +297,151 @@ enum Analyser {
         guard boundary > 1 else { return value }
         let remainder = value % boundary
         return remainder == 0 ? value : value &+ (boundary - remainder)
+    }
+}
+
+extension Analyser {
+    /// Spec §6.2 / [ARMARM]: an 8-bit value rotated right by an even amount.
+    /// Enforced as a diagnostic even though the emitted AArch64 has no such
+    /// restriction — the transpiler must not accept what real armasm rejects.
+    ///
+    /// `rotation` only ever ranges 0...30, so `32 - rotation` only ever ranges
+    /// 2...32; the `% 32` folds the rotation-0 case's would-be `>> 32` down to
+    /// `>> 0` before it happens, so this never shifts by the type's own bit width
+    /// (which Swift's smart shift operators define as 0, not a trap, but the
+    /// point is this function never relies on that). The loop is a bounded
+    /// `stride`, not a manual counter, so it cannot spin.
+    static func isEncodableModifiedImmediate(_ value: UInt32) -> Bool {
+        for rotation in stride(from: 0, to: 32, by: 2) {
+            let rotated = value << UInt32(rotation) | value >> UInt32((32 - rotation) % 32)
+            if rotated & ~0xFF == 0 { return true }
+        }
+        return false
+    }
+
+    /// Spec §6.2, §9 D1, §9 D2, §9 D8.
+    static func check(
+        _ instruction: Instruction,
+        symbols: SymbolTable,
+        address: UInt32,
+        diagnostics: inout DiagnosticBag
+    ) {
+        // Spec §7.5: `MOV PC, LR` is, alongside `BX LR`, the one sanctioned way to
+        // write R15 — the backend lowers both as a function return. R15 there is
+        // a destination, not a value being *read* as data, so D2's rule doesn't
+        // apply to it. Every other data-processing/multiply mnemonic puts the
+        // destination register at operands[0] too (Spec §6.3: "Rd, Rn, Operand2, or
+        // Rd, Operand2 for MOV/MVN"), so dropping just this one exact pattern from
+        // the loop below — rather than exempting operand[0] in general — keeps
+        // `CMP R15, ...`, `ADD R15, R1, #4`, etc. flagged as before.
+        let isMovPCFromLR = instruction.mnemonic == .mov
+            && instruction.operands.count == 2
+            && instruction.operands[0] == .register(15)
+            && instruction.operands[1] == .operand2(.register(14))
+        let operandsToCheck = isMovPCFromLR ? Array(instruction.operands.dropFirst()) : instruction.operands
+
+        for operand in operandsToCheck {
+            switch operand {
+            case .register(15):
+                diagnostics.emit(Diagnostic(
+                    severity: .error, code: "E021",
+                    message: "R15 cannot be used as a data operand",
+                    range: instruction.range,
+                    note: "Spec §9 D2: R15 holds a synthetic address for display only"
+                ))
+
+            case .operand2(.immediate(let expression)):
+                var scratch = diagnostics
+                if let value = ExpressionEvaluator.evaluate(
+                    expression, symbols: symbols, here: address,
+                    range: instruction.range, diagnostics: &scratch
+                ), !isEncodableModifiedImmediate(value) {
+                    diagnostics = scratch
+                    diagnostics.emit(Diagnostic(
+                        severity: .error, code: "E020",
+                        message: "immediate #0x\(String(value, radix: 16, uppercase: true)) cannot be encoded",
+                        range: instruction.range,
+                        note: "ARM7 immediates are an 8-bit value rotated right by an even amount; use LDR Rd, =value"
+                    ))
+                } else {
+                    diagnostics = scratch
+                }
+
+            case .operand2(.register(15)):
+                diagnostics.emit(Diagnostic(
+                    severity: .error, code: "E021",
+                    message: "R15 cannot be used as a data operand",
+                    range: instruction.range,
+                    note: "Spec §9 D2: R15 holds a synthetic address for display only"
+                ))
+
+            case .operand2(.shifted(let register, let shift)):
+                // D2 is a blanket rule on *reading* R15 as data — the shifted
+                // operand's base register is read before the shift is applied, same
+                // as the bare-register and immediate forms above.
+                if register == 15 {
+                    diagnostics.emit(Diagnostic(
+                        severity: .error, code: "E021",
+                        message: "R15 cannot be used as a data operand",
+                        range: instruction.range,
+                        note: "Spec §9 D2: R15 holds a synthetic address for display only"
+                    ))
+                }
+                // Spec §9 D1 names an exact set: MOVS, ANDS, ORRS, EORS, BICS, TST, TEQ
+                // source C from the shifter. ADDS/SUBS/CMP/CMN are explicitly excluded
+                // — their C/V come from the ALU's add/subtract and are unaffected, even
+                // though `mnemonic.isComparison` (cmp/cmn/tst/teq) would otherwise lump
+                // CMP/CMN in here too.
+                let sourcesCarryFromShifter: Bool
+                switch instruction.mnemonic {
+                case .tst, .teq: sourcesCarryFromShifter = true
+                case .mov, .and, .orr, .eor, .bic: sourcesCarryFromShifter = instruction.setsFlags
+                default: sourcesCarryFromShifter = false
+                }
+                if sourcesCarryFromShifter {
+                    diagnostics.emit(Diagnostic(
+                        severity: .warning, code: "W010",
+                        message: "carry flag result of the barrel shifter is not modelled; C is unchanged",
+                        range: instruction.range,
+                        note: "Spec §9 D1. N and Z are correct."
+                    ))
+                }
+                if let amount = shift.amount {
+                    var scratch = diagnostics
+                    let value = ExpressionEvaluator.evaluate(
+                        amount, symbols: symbols, here: address,
+                        range: instruction.range, diagnostics: &scratch
+                    )
+                    diagnostics = scratch
+                    if let value, value >= 32 {
+                        diagnostics.emit(Diagnostic(
+                            severity: .warning, code: "W012",
+                            message: "shift amount \(value) is 32 or greater",
+                            range: instruction.range,
+                            note: "Spec §9 D8: ARM7 saturates, A64 wraps at 32"
+                        ))
+                    }
+                }
+
+            default:
+                break
+            }
+        }
+
+        // Spec §7.5: `BX Rm` where `Rm` isn't LR is not lowered — only `BX LR` (a
+        // function return) is supported. A single-operand instruction's sole
+        // register always parses as the *trailing* Operand2 form
+        // (`Parser.registerIsTrailingOperand2` returns true at end-of-line), so it
+        // reaches here as `.operand2(.register(_))`, never bare `.register(_)`.
+        if instruction.mnemonic == .bx,
+           case .operand2(.register(let register))? = instruction.operands.first,
+           register != 14 {
+            diagnostics.emit(Diagnostic(
+                severity: .error, code: "E014",
+                message: "computed branch through R\(register) is not supported",
+                range: instruction.range,
+                note: "Spec §7.5: only BX LR is lowered"
+            ))
+        }
     }
 }

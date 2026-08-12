@@ -485,6 +485,286 @@ private func analyse(_ source: String) -> (AnalysedProgram, DiagnosticBag) {
     #expect(after == before + 10)
 }
 
+// MARK: - Semantic diagnostics (Task 11)
+
+@Test func modifiedImmediateEncodingMatchesARM7Rules() {
+    // 8-bit value rotated right by an even amount.
+    #expect(Analyser.isEncodableModifiedImmediate(0x12))
+    #expect(Analyser.isEncodableModifiedImmediate(0xFF))
+    #expect(Analyser.isEncodableModifiedImmediate(0x3F00))       // 0xFC ror 30
+    #expect(Analyser.isEncodableModifiedImmediate(0xFF00_0000))
+    #expect(Analyser.isEncodableModifiedImmediate(0x101) == false)
+    #expect(Analyser.isEncodableModifiedImmediate(0x1FE) == false)
+}
+
+@Test func analyserRejectsAnUnencodableImmediate() {
+    let (_, bag) = analyse("""
+        AREA PROGRAM, CODE, READONLY
+        ENTRY
+    MAIN
+        MOV R1, #0x101
+    """)
+    #expect(bag.diagnostics.map(\.code).contains("E020"))
+    #expect(bag.hasErrors)
+}
+
+@Test func analyserWarnsAboutUnmodelledShifterCarry() {
+    // Spec §9 D1.
+    let (_, bag) = analyse("""
+        AREA PROGRAM, CODE, READONLY
+        ENTRY
+    MAIN
+        MOVS R3, R1, LSL #2
+    """)
+    #expect(bag.hasErrors == false)
+    #expect(bag.diagnostics.map(\.code).contains("W010"))
+}
+
+@Test func analyserRejectsReadingR15AsData() {
+    // Spec §9 D2.
+    let (_, bag) = analyse("""
+        AREA PROGRAM, CODE, READONLY
+        ENTRY
+    MAIN
+        ADD R1, R15, #4
+    """)
+    #expect(bag.diagnostics.map(\.code).contains("E021"))
+}
+
+// MARK: - Strengthening beyond the brief
+
+@Test func modifiedImmediateRejectsValuesRequiringMoreThanEightSetBits() {
+    // Pins the mask check itself: a wrong implementation that only checked whether
+    // *some* rotation reduced the value below 256 (e.g. `rotated < 0x100` on a signed
+    // read, or a mask of `~0xFF` applied before rotating) could wrongly accept a value
+    // whose bits are simply spread too far apart to ever land in one 8-bit window.
+    // 0x101 (bits 0 and 8) can never be brought within 8 contiguous bits by *any*
+    // rotation, even or odd — this is the "no rotation at all works" case, distinct
+    // from the "only an odd rotation works" case below.
+    #expect(Analyser.isEncodableModifiedImmediate(0x101) == false)
+    #expect(Analyser.isEncodableModifiedImmediate(0xFFFF_FFFF) == false)
+}
+
+@Test func modifiedImmediateRejectsAValueThatOnlyAnOddRotationCanReach() {
+    // 0x1FE is eight *contiguous* set bits (bits 1..8), so it fits an 8-bit window —
+    // but only by rotating right 1 (odd). A wrong implementation that iterated over
+    // odd rotations too (e.g. `stride(from: 0, to: 32, by: 1)`, or a fence-post error
+    // extending the `by: 2` stride one step too far) would wrongly accept this.
+    #expect(Analyser.isEncodableModifiedImmediate(0x1FE) == false)
+}
+
+@Test func modifiedImmediateAcceptsZeroAndRejectsEveryBitSet() {
+    // 0 is the trivial rotation-0 case; a wrong implementation of the loop bound or
+    // the `& ~0xFF` mask could special-case it wrong in either direction. All-ones
+    // needs all 32 bits, which is far beyond any single rotated 8-bit value.
+    #expect(Analyser.isEncodableModifiedImmediate(0x0))
+    #expect(Analyser.isEncodableModifiedImmediate(0xFFFF_FFFF) == false)
+}
+
+@Test func modifiedImmediateAcceptsTheHighestEvenRotation() {
+    // 0x1 rotated right by 30 (the last rotation the loop visits, since the stride
+    // stops before 32) is 0x4 — 1 rotated right by 2 == ROL(1, 30). A wrong
+    // implementation with an off-by-one loop bound (`to: 30` instead of `to: 32`,
+    // dropping rotation 30 entirely) would miss exactly this case.
+    #expect(Analyser.isEncodableModifiedImmediate(0x4))
+}
+
+@Test func analyserAcceptsAnEncodableImmediateWithNoDiagnostic() {
+    // The positive twin of analyserRejectsAnUnencodableImmediate: an encodable
+    // immediate must produce *no* E020, and no diagnostic at all. Without this, a
+    // wrong implementation that always emitted E020 regardless of encodability (or
+    // that dropped the `!isEncodableModifiedImmediate` negation) would still pass
+    // the rejection test above but flag every immediate as an error.
+    let (_, bag) = analyse("""
+        AREA PROGRAM, CODE, READONLY
+        ENTRY
+    MAIN
+        MOV R1, #0x12
+    """)
+    #expect(bag.hasErrors == false)
+    #expect(bag.diagnostics.isEmpty)
+}
+
+@Test func analyserPreservesAnUndefinedSymbolDiagnosticInAnImmediateOperand() {
+    // Pins the diagnostics-dance around evaluating an immediate operand's expression:
+    // ExpressionEvaluator.evaluate already emits E031 for an undefined symbol and
+    // returns nil. A wrong ordering of `diagnostics = scratch` versus the E020 emit
+    // could either lose that E031 (assigning `diagnostics = scratch` before scratch
+    // is populated, or never assigning it on the nil path) or duplicate it (emitting
+    // into `diagnostics` *and* keeping `scratch`'s copy). Exactly one E031, and no
+    // spurious E020 riding along with it (an evaluation failure is not the same as an
+    // unencodable-but-known value).
+    let (_, bag) = analyse("""
+        AREA PROGRAM, CODE, READONLY
+        ENTRY
+    MAIN
+        MOV R1, #NOPE
+    """)
+    #expect(bag.diagnostics.map(\.code) == ["E031"])
+}
+
+@Test func analyserDoesNotWarnAboutShifterCarryWhenFlagsAreNotSet() {
+    // The negative twin of analyserWarnsAboutUnmodelledShifterCarry: a shifted
+    // Operand2 on a plain (non-S) MOV never sets flags, so C is never read from the
+    // shifter in the first place — W010 would be a false positive here. A wrong
+    // implementation that warned on any shifted operand regardless of `setsFlags`
+    // (or that mixed up `&&` for `||`, e.g. requiring flags-set *and* comparison)
+    // would fail this.
+    let (_, bag) = analyse("""
+        AREA PROGRAM, CODE, READONLY
+        ENTRY
+    MAIN
+        MOV R3, R1, LSL #2
+    """)
+    #expect(bag.diagnostics.map(\.code).contains("W010") == false)
+}
+
+@Test func analyserWarnsAboutShifterCarryOnTstEvenWithoutTheSSuffix() {
+    // TST/TEQ always set flags whether or not `S` is written (Spec §6.3), and they
+    // are in D1's "logical" family that sources C from the shifter — so
+    // `instruction.setsFlags` alone is not enough to gate W010 for them. A wrong
+    // implementation that only tested `setsFlags` would miss this, since the parser
+    // never sets `setsFlags` true for an unsuffixed TST.
+    let (_, bag) = analyse("""
+        AREA PROGRAM, CODE, READONLY
+        ENTRY
+    MAIN
+        TST R1, R2, LSL #2
+    """)
+    #expect(bag.diagnostics.map(\.code).contains("W010"))
+}
+
+@Test func analyserDoesNotWarnAboutShifterCarryOnCmpOrAdds() {
+    // Spec §9 D1, verbatim: "ADDS/SUBS/CMP/CMN are unaffected — their C and V come
+    // from the ALU and match exactly." A wrong implementation that gated W010 on
+    // `mnemonic.isComparison` (cmp/cmn/tst/teq) rather than the exact logical-family
+    // list D1 names would wrongly warn on CMP and ADDS here, since `isComparison`
+    // lumps CMP in with TST/TEQ despite the spec explicitly excluding it.
+    let (_, bag) = analyse("""
+        AREA PROGRAM, CODE, READONLY
+        ENTRY
+    MAIN
+        CMP R1, R2, LSL #2
+        ADDS R3, R1, R2, LSL #2
+    """)
+    #expect(bag.diagnostics.map(\.code).contains("W010") == false)
+}
+
+@Test func analyserWarnsAboutAShiftAmountOfExactlyThirtyTwo() {
+    // Pins the >= 32 boundary exactly (not > 32): 32 itself must warn. A wrong
+    // implementation guarding `> 32` instead of `>= 32` would silently accept it,
+    // even though A64's lslv wraps a shift-by-32 to a no-op while ARM7 saturates
+    // to zero — the two disagree right at this boundary.
+    let (_, bag) = analyse("""
+        AREA PROGRAM, CODE, READONLY
+        ENTRY
+    MAIN
+        MOV R1, R2, LSL #32
+    """)
+    #expect(bag.diagnostics.map(\.code).contains("W012"))
+}
+
+@Test func analyserDoesNotWarnAboutAShiftAmountJustBelowThirtyTwo() {
+    // The boundary's negative twin: 31 must not warn. Without this, a test only
+    // checking the >= 32 side could pass a wrong implementation that warns on
+    // every shift regardless of amount (e.g. dropping the `value >= 32` condition
+    // entirely).
+    let (_, bag) = analyse("""
+        AREA PROGRAM, CODE, READONLY
+        ENTRY
+    MAIN
+        MOV R1, R2, LSL #31
+    """)
+    #expect(bag.diagnostics.map(\.code).contains("W012") == false)
+}
+
+@Test func analyserDoesNotCrashOnAShiftAmountThatFailsToEvaluate() {
+    // The shift-amount dance's failure path: an undefined symbol as the shift amount
+    // must surface its own E031 (from ExpressionEvaluator) without the W012 check
+    // then force-unwrapping a nil value amount into the `value >= 32` comparison.
+    let (_, bag) = analyse("""
+        AREA PROGRAM, CODE, READONLY
+        ENTRY
+    MAIN
+        MOV R1, R2, LSL #NOPE
+    """)
+    #expect(bag.diagnostics.map(\.code) == ["E031"])
+}
+
+@Test func analyserDoesNotFlagR15AsAnOrdinaryDestinationRegister() {
+    // Spec §7.5 explicitly sanctions `MOV PC, LR` (alongside `BX LR`) as the return
+    // idiom the backend lowers. R15 there is *written*, not read as data — D2's rule
+    // ("reading R15 as a data operand is E021") does not apply to a destination.
+    // A wrong implementation that flags any bare `.register(15)` regardless of
+    // operand position — which is what the naive "every operand" loop does — would
+    // reject this legitimate, spec-mandated instruction.
+    let (_, bag) = analyse("""
+        AREA PROGRAM, CODE, READONLY
+        ENTRY
+    MAIN
+        MOV PC, LR
+    """)
+    #expect(bag.diagnostics.map(\.code).contains("E021") == false)
+}
+
+@Test func analyserFlagsR15AsAComparisonSourceRegister() {
+    // CMP/CMN/TST/TEQ have no destination — their first operand is Rn, a genuine
+    // read (Spec §6.3: "Rn, Operand2 for the compare forms"). The MOV-PC-LR carve-out
+    // above must not overreach into exempting operand[0] for these mnemonics too,
+    // or a read of R15 through CMP would silently produce a wrong, unmodelled value.
+    let (_, bag) = analyse("""
+        AREA PROGRAM, CODE, READONLY
+        ENTRY
+    MAIN
+        CMP R15, #4
+    """)
+    #expect(bag.diagnostics.map(\.code).contains("E021"))
+}
+
+@Test func analyserFlagsR15AsTheBaseOfAShiftedOperand() {
+    // Spec §9 D2 is a blanket rule ("reading R15 as a data operand is E021"), not
+    // scoped to just the immediate/bare-register Operand2 forms. A shifted operand's
+    // *base* register is still read as data before the shift is applied — a wrong
+    // implementation that pattern-matched `.shifted(_, let shift)` and discarded the
+    // register entirely (as the plan's own sample code does) would let this through
+    // with no diagnostic at all.
+    let (_, bag) = analyse("""
+        AREA PROGRAM, CODE, READONLY
+        ENTRY
+    MAIN
+        ADD R1, R2, R15, LSL #2
+    """)
+    #expect(bag.diagnostics.map(\.code).contains("E021"))
+}
+
+@Test func analyserRejectsAComputedBranchThroughARegisterOtherThanLR() {
+    // Spec §7.5: only `BX LR` is lowered; any other `BX Rm` is E014. Because a
+    // single-operand instruction's sole register always parses as the *trailing*
+    // Operand2 form (`.operand2(.register(n))`, never bare `.register(n)` — see
+    // `Parser.registerIsTrailingOperand2`, which returns true at end-of-line), a
+    // check written against `case .register(let register)? = operands.first` can
+    // never match a real BX instruction and would silently never fire.
+    let (_, bag) = analyse("""
+        AREA PROGRAM, CODE, READONLY
+        ENTRY
+    MAIN
+        BX R0
+    """)
+    #expect(bag.diagnostics.map(\.code).contains("E014"))
+}
+
+@Test func analyserAcceptsBxLrWithNoDiagnostic() {
+    // The positive twin: `BX LR` is the one form that must never be flagged.
+    let (_, bag) = analyse("""
+        AREA PROGRAM, CODE, READONLY
+        ENTRY
+    MAIN
+        BX LR
+    """)
+    #expect(bag.diagnostics.map(\.code).contains("E014") == false)
+    #expect(bag.hasErrors == false)
+}
+
 @Test func analyserAlignZeroFromSourceDoesNotHangOrCrash() {
     // Termination guard: `align(_:to:)` must not divide by zero or spin when the
     // boundary is 0 or 1 — including when `ALIGN 0` reaches it straight from
