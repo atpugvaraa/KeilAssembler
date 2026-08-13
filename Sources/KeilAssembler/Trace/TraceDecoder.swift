@@ -1,15 +1,35 @@
 import Foundation
 
 /// One ARM7 machine state, as recorded after a single instruction. Spec §7.7.
-struct MachineSnapshot: Sendable, Equatable {
-    let seq: UInt32
-    let sourceLine: Int
-    let pc: UInt32
-    let registers: [UInt32]     // 16 entries, R0...R15
-    let cpsr: UInt32
-    let storeAddress: UInt32
-    let storeValue: UInt32
-    let storeWidth: UInt32
+public struct MachineSnapshot: Sendable, Equatable {
+    public let seq: UInt32
+    public let sourceLine: Int
+    public let pc: UInt32
+    public let registers: [UInt32]     // 16 entries, R0...R15
+    public let cpsr: UInt32
+    public let storeAddress: UInt32
+    public let storeValue: UInt32
+    public let storeWidth: UInt32
+
+    public init(
+        seq: UInt32,
+        sourceLine: Int,
+        pc: UInt32,
+        registers: [UInt32],
+        cpsr: UInt32,
+        storeAddress: UInt32,
+        storeValue: UInt32,
+        storeWidth: UInt32
+    ) {
+        self.seq = seq
+        self.sourceLine = sourceLine
+        self.pc = pc
+        self.registers = registers
+        self.cpsr = cpsr
+        self.storeAddress = storeAddress
+        self.storeValue = storeValue
+        self.storeWidth = storeWidth
+    }
 }
 
 /// Decodes `trace.bin`, the fixed-size record stream `armd_trace` (Spec §7.8)

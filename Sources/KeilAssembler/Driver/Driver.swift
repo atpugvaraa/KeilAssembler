@@ -1,24 +1,36 @@
 import Foundation
 
-struct CompileResult: Sendable {
-    let diagnostics: [Diagnostic]
-    let assembly: String?
-    var hasErrors: Bool { diagnostics.contains { $0.severity == .error } }
+public enum ToolchainStatus: Sendable, Equatable {
+    case ready
+    /// Carries clang's own stderr, so a failure that isn't the expected missing-CLT
+    /// one is still diagnosable rather than being flattened into "something broke".
+    case missing(reason: String)
 }
 
-struct RunResult: Sendable {
-    let snapshots: [MachineSnapshot]
-    let diagnostics: [Diagnostic]
-    let exitCode: Int32
-    let standardError: String
+public struct CompileResult: Sendable {
+    public let diagnostics: [Diagnostic]
+    public let assembly: String?
+    public var hasErrors: Bool { diagnostics.contains { $0.severity == .error } }
+}
+
+public struct RunResult: Sendable {
+    public let snapshots: [MachineSnapshot]
+    public let diagnostics: [Diagnostic]
+    public let exitCode: Int32
+    public let standardError: String
     /// The directory this run's executable, `image.bin`, and `trace.bin` live
     /// in (Spec §7.9). `Driver.run` deletes its own auto-created directory on
     /// a successful (exit code 0) run — this is only useful for a caller-
     /// supplied directory, or for inspecting a failed run before cleaning up.
-    let runDirectory: URL
+    public let runDirectory: URL
+    /// The analysed program's data image, then `preload.entries` in that order —
+    /// a preload entry overwrites a `DCD` at the same address (Spec §5.3). Fed to
+    /// `MemoryImage.init(initial:)`/`folding(initial:...)` by a caller wanting to
+    /// show ARM7 memory rather than just registers.
+    public let initialMemory: [(address: UInt32, bytes: [UInt8])]
 
     /// The register state after the last executed instruction, or all zeros.
-    var finalRegisters: [UInt32] {
+    public var finalRegisters: [UInt32] {
         snapshots.last?.registers ?? [UInt32](repeating: 0, count: 16)
     }
 }
@@ -26,13 +38,13 @@ struct RunResult: Sendable {
 /// Spec §7.9. Each run gets its own directory holding the executable, `image.bin`,
 /// and `trace.bin`, so runs never collide and a run is reproducible from its
 /// directory alone.
-struct Driver: Sendable {
-    enum Failure: Error, CustomStringConvertible {
+public struct Driver: Sendable {
+    public enum Failure: Error, CustomStringConvertible {
         case toolFailed(tool: String, status: Int32, output: String)
         case runtimeSourceMissing
         case compilationProducedNoAssembly([Diagnostic])
 
-        var description: String {
+        public var description: String {
             switch self {
             case .toolFailed(let tool, let status, let output):
                 "\(tool) exited \(status): \(output)"
@@ -49,9 +61,9 @@ struct Driver: Sendable {
 
     let clangURL = URL(fileURLWithPath: "/usr/bin/clang")
 
-    init() {}
+    public init() {}
 
-    func compile(source: String) -> CompileResult {
+    public func compile(source: String) -> CompileResult {
         var diagnostics = DiagnosticBag()
         let tokens = Lexer(source: source).tokenize(into: &diagnostics)
         var parser = Parser(tokens: tokens)
@@ -61,7 +73,7 @@ struct Driver: Sendable {
         return CompileResult(diagnostics: diagnostics.diagnostics, assembly: assembly)
     }
 
-    func run(
+    public func run(
         source: String,
         preload: MemoryPreload,
         in directory: URL? = nil
@@ -89,10 +101,21 @@ struct Driver: Sendable {
             .encode(dataImage: analysed.dataImage, preload: preload)
             .write(to: runDirectory.appendingPathComponent("image.bin"))
 
-        guard let runtimeURL = Bundle.module.url(forResource: "armd_rt", withExtension: "c") else {
-            PerfLog.error("armd_rt.c not found in Bundle.module")
+        // The runtime ships as `armd_rt.c.txt`, not `armd_rt.c`. Xcode's SwiftPM
+        // integration classifies a `.c` file inside a target as a source to compile
+        // and drops it from the resource bundle, so an app embedding this package
+        // found a bundle holding nothing but Info.plist — while `swift test`, which
+        // honours `.copy`, passed. The `.txt` extension keeps Xcode's source scanner
+        // off it.
+        //
+        // clang infers the language from the extension, so it is written back out as
+        // `armd_rt.c` into the run directory beside `program.s` and `image.bin`.
+        guard let runtimeResource = Bundle.module.url(forResource: "armd_rt.c", withExtension: "txt") else {
+            PerfLog.error("armd_rt.c.txt not found in Bundle.module")
             throw Failure.runtimeSourceMissing
         }
+        let runtimeURL = runDirectory.appendingPathComponent("armd_rt.c")
+        try Data(contentsOf: runtimeResource).write(to: runtimeURL)
 
         let executableURL = runDirectory.appendingPathComponent("program")
         try PerfLog.measure("assemble-and-link") {
@@ -125,7 +148,8 @@ struct Driver: Sendable {
             diagnostics: diagnostics.diagnostics,
             exitCode: execution.status,
             standardError: execution.errorOutput,
-            runDirectory: runDirectory
+            runDirectory: runDirectory,
+            initialMemory: analysed.dataImage.map { (address: $0.address, bytes: $0.bytes) } + preload.entries
         )
     }
 
@@ -136,6 +160,33 @@ struct Driver: Sendable {
     /// still can't fail the build, only surface in `standardError`.
     static func clangBuildArguments(executable: String, assembly: String, runtime: String) -> [String] {
         ["-Wall", "-Wextra", "-o", executable, assembly, runtime]
+    }
+
+    /// Whether this Mac can actually build, checked by building.
+    ///
+    /// `/usr/bin/clang` exists on a stock macOS install without Command Line
+    /// Tools — it is a shim that fails at run time with "xcode-select: note: no
+    /// developer tools were found". A path check therefore passes on a machine
+    /// where every build fails. Compiling a trivial program exercises the exact
+    /// dependency `run` has, so there is nothing left to guess about.
+    public func preflight() -> ToolchainStatus {
+        do {
+            let directory = try makeRunDirectory()
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let source = directory.appendingPathComponent("probe.c")
+            try "int main(void) { return 0; }\n".write(to: source, atomically: true, encoding: .utf8)
+            let result = try invokeCapturing(clangURL, arguments: [
+                "-o", directory.appendingPathComponent("probe").path, source.path
+            ], in: directory)
+            if result.status != 0 {
+                PerfLog.error("preflight failed: \(result.errorOutput)")
+                return .missing(reason: result.errorOutput)
+            }
+            return .ready
+        } catch {
+            PerfLog.error("preflight threw: \(error)")
+            return .missing(reason: String(describing: error))
+        }
     }
 
     // MARK: - Process plumbing

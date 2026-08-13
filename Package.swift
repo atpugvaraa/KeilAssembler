@@ -10,7 +10,7 @@ let package = Package(
     targets: [
         .target(
             name: "KeilAssembler",
-            resources: [.copy("Runtime/Resources/armd_rt.c")]
+            resources: [.copy("Runtime/Resources/armd_rt.c.txt")]
         ),
         .testTarget(
             name: "KeilAssemblerTests",

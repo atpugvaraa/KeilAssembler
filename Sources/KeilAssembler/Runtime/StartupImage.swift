@@ -2,10 +2,10 @@ import Foundation
 
 /// Spec §5.3. Memory contents supplied by the client rather than by the source —
 /// how the lab's Memory-window values are expressed.
-struct MemoryPreload: Sendable {
-    var entries: [(address: UInt32, bytes: [UInt8])]
+public struct MemoryPreload: Sendable {
+    public var entries: [(address: UInt32, bytes: [UInt8])]
 
-    init(entries: [(address: UInt32, bytes: [UInt8])] = []) {
+    public init(entries: [(address: UInt32, bytes: [UInt8])] = []) {
         self.entries = entries
     }
 
@@ -13,7 +13,7 @@ struct MemoryPreload: Sendable {
     /// dictionary has no inherent iteration order, and the startup image's
     /// byte layout must be deterministic across runs (Spec §5.3), so entries
     /// are sorted by address before `encode` ever sees them.
-    init(words: [UInt32: UInt32]) {
+    public init(words: [UInt32: UInt32]) {
         entries = words.sorted { $0.key < $1.key }.map { address, value in
             (address, (0...3).map { UInt8(truncatingIfNeeded: value >> UInt32($0 * 8)) })
         }
